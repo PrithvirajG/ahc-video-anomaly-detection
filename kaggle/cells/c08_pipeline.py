@@ -157,7 +157,17 @@ def process_video(path, cfg=None, verbose=False) -> dict:
     t_vlm = time.time() - t_vlm0
     n_scan = sum(1 for _, s in to_look_at if s == "scan")
 
-    duration = kept[-1]["t"] + 1.0 / cfg.sample_fps if kept else video_duration(path)
+    # The CONTAINER duration, not "wherever the last surviving frame landed".
+    # Those differ by up to 2.7s on the practice pack, always short, because the
+    # motion gate can drop the tail of a video - measured against the arena's own
+    # manifest: T025 237.6 vs 240.0, T033 626.1 vs 628.8. It mattered little while
+    # a 180s cap kept every event away from the end; with that cap gone an event
+    # can legitimately run to the final frame, and clamping it to a duration 2.7s
+    # short trims real overlap off exactly the long D3 events that pay 5 marks
+    # each. It is also what cell 10 falls back to when no manifest file is
+    # present, which on the practice pack is always.
+    duration = duration_full if duration_full else (
+        kept[-1]["t"] + 1.0 / cfg.sample_fps if kept else 0.0)
 
     # The health curve is what lets aggregation MEASURE an event's extent rather
     # than assume it - it is computed per frame in stage 1 and was previously
