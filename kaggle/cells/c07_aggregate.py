@@ -107,17 +107,29 @@ def extent_buffer(cfg=None) -> float:
 
 
 def _recovered_between(health_curve, t_a: float, t_b: float, loose: float) -> bool:
-    """Did the scene demonstrably return to normal between two detections?
+    """RETIRED as a splitting criterion. Kept for diagnostics only.
 
-    This replaces both gap constants. A majority vote over the samples strictly
-    between the two windows: if most of them climbed back above `loose`, the
-    scene recovered and these are two incidents; if they stayed depressed, it
-    never stopped and this is one. Majority rather than "any", so a single noisy
-    frame cannot split a real event.
+    The idea was sound and the signal is not. Measured on the five-video run,
+    comparing health inside a real ground-truth event against health outside it
+    in the same video:
 
-    With no curve to consult we return False - absence of evidence for recovery
-    is not evidence of it, and merging is the conservative choice given the
-    arena penalises fragments twice (the miss, plus each extra as a false alarm).
+        T026  inside +0.134  outside +0.608   separation +0.474   works
+        T031  inside -0.085  outside -0.092   separation -0.007   flat
+        T032  inside +0.531  outside +0.415   separation -0.116   INVERTED
+        T025  inside +0.150  outside -0.097   separation -0.247   INVERTED
+
+    On three of four videos the frames containing the anomaly are as healthy as
+    or HEALTHIER than the rest of the video - event frames sit at the 65th
+    percentile of their own video's health. A congested road looks like a road;
+    a person loitering looks like a person. Only T026's road spill, a plainly
+    visible appearance change, separates at all.
+
+    Used as a split test this was catastrophic on T031: health_thresh is
+    calibrated globally at about -0.4, so loose is about -0.16, and T031's
+    *minimum* health over 656 samples is -0.119. Every sample reads as
+    "recovered", so eighteen agreeing congestion windows became eighteen events
+    and eighteen false alarms. The best contiguous subset of those same windows
+    scores IoU 0.917.
     """
     if not health_curve:
         return False
@@ -175,38 +187,51 @@ def measure_extent(cluster: list[dict], health_curve, thresh: float,
 
 def cluster_windows(windows: list[dict], health_curve=None,
                     thresh: float | None = None) -> list[list[dict]]:
-    """Group detections into incidents by asking whether the scene recovered.
+    """Group same-class detections into one incident. Split only on class.
 
-    One rule now serves both the same-class and cross-class cases, because it
-    was never really a question about class or about elapsed time:
+    We do not split on time, because a gap constant cannot express the question
+    (T031 needs windows at 9s and 209s separated but 249s and 348s joined). We
+    no longer split on the health curve either, because that curve is flat or
+    inverted on three of four measured videos - see _recovered_between().
 
-      - T031: fourteen windows spanning 9s-311s all calling traffic_congestion,
-        truth is one 125s event at 235-360. A gap constant merges all of them
-        (IoU 0.22) or splits all of them (~0.02 each). The curve splits them
-        where the road actually cleared.
-      - T033: an accident at 507s and smoke at 523s are one incident seen twice
-        and must merge across a class change; the same video's 385s detection is
-        a different incident and must not. Elapsed time cannot tell those apart.
-        Whether health recovered in between can.
+    So there is currently NO validated signal for where one incident ends and
+    the next begins, and this asserts none. Measured on the five-video run,
+    which is the whole justification:
 
-    Falls back to strict adjacency when there is no curve, which is the honest
-    behaviour: with no evidence about the interval we only merge detections that
-    actually touch.
+        rule                          matched   false alarms   events
+        health recovery (shipped)        0           20          20
+        per-video relative recovery      0           12          12
+        merge same class  <- this        0            2           2
+        any time gap >= 60s              0            2           2
+
+    Nothing recovers a match, because only 1 of the 15 ground-truth events is
+    reachable from these windows at all. But asserting eighteen boundaries we
+    cannot support costs eighteen false alarms, and the arena charges for each
+    one. When the evidence does not distinguish, claim less.
+
+    This becomes wrong the moment a video genuinely contains two separate
+    incidents of the same class - T025 has six - so it is a stopgap, and the
+    thing that unblocks it is a health signal that actually tracks anomalies,
+    i.e. the linear probe.
+
+    health_curve and thresh are accepted and ignored, so the call sites and the
+    diagnostics that pass them keep working.
     """
-    ws = sorted((w for w in windows if w["class"] != "normal"), key=lambda w: w["t0"])
-    if thresh is None:
-        thresh = CFG.health_thresh if CFG.health_thresh is not None else -0.4
-    loose = thresh * EXTENT_LOOSE_FACTOR
-
+    ws = sorted(windows, key=lambda w: w["t0"])
+    hits = [w for w in ws if w["class"] != "normal"]
     clusters, cur = [], []
-    for w in ws:
+    for w in hits:
         if cur:
             prev = cur[-1]
-            if health_curve:
-                split = _recovered_between(health_curve, prev["t1"], w["t0"], loose)
-            else:
-                split = w["t0"] > prev["t1"] + 1e-6      # no curve: touch or split
-            if split:
+            # Split where STAGE 2 ITSELF said normal. That is a judgement from
+            # the model that can see the scene, it needs no constant, and it is
+            # the only recovery signal we have left now the health curve has
+            # been shown to be flat or inverted. Measured on the 34-video run it
+            # recovers T033's cross-class match (smoke at 507s and an
+            # altercation at 523s with nothing normal between them are one
+            # incident) at the same false-alarm count as splitting on class.
+            if any(x["class"] == "normal" and prev["t1"] <= x["t0"] and x["t1"] <= w["t0"]
+                   for x in ws):
                 clusters.append(cur)
                 cur = []
         cur.append(w)
@@ -318,21 +343,33 @@ def _selftest():
     assert ev["end_time_sec"] - ev["start_time_sec"] > 500, \
         f"a 600s event must survive aggregation, got {ev}"
 
-    # SPLIT ON RECOVERY: the T031 shape. Windows agree on the class throughout,
-    # but the scene demonstrably clears in the middle, so this is two incidents
-    # and not one 300s blob. No gap constant can express this.
+    # SAME CLASS NEVER SPLITS, whatever the curve does. This is the T031 shape,
+    # and it asserts a deliberate retreat: an earlier version split here on a
+    # health recovery, which turned 18 agreeing congestion windows into 18 false
+    # alarms on the real video because that curve is flat (its whole range sits
+    # above the "recovered" line). Until a signal exists that actually tracks
+    # anomalies, we assert one incident rather than eighteen boundaries we
+    # cannot support.
     recov = [(t, 0.2 if 120 <= t <= 220 else -0.5) for t in range(0, 320, 2)]
-    evs = aggregate_events([mk("traffic_congestion", t, 0.9)
-                            for t in (20, 60, 100, 240, 280, 300)],
-                           health_curve=recov, duration_sec=320.0)
-    assert len(evs) == 2, f"recovery in the middle must split, got {len(evs)}"
-
-    # ...and with health depressed throughout, the same detections are ONE event
+    same = [mk("traffic_congestion", t, 0.9) for t in (20, 60, 100, 240, 280, 300)]
+    assert len(aggregate_events(same, health_curve=recov, duration_sec=320.0)) == 1, \
+        "same class must not split on a curve we have shown to be unreliable"
     flat = [(t, -0.5) for t in range(0, 320, 2)]
-    evs = aggregate_events([mk("traffic_congestion", t, 0.9)
-                            for t in (20, 60, 100, 240, 280, 300)],
-                           health_curve=flat, duration_sec=320.0)
-    assert len(evs) == 1, f"no recovery -> one ongoing event, got {len(evs)}"
+    assert len(aggregate_events(same, health_curve=flat, duration_sec=320.0)) == 1, \
+        "...and the same with no recovery at all"
+
+    # A class change alone does NOT split: T033's smoke at 507s and altercation
+    # at 523s are one incident seen twice, and the adjudicator exists to name it.
+    mixed = [mk("smoke", 507.5, 0.95), mk("fighting_or_violence", 523.5, 0.90)]
+    assert len(cluster_windows(mixed)) == 1, "a class change alone is not a boundary"
+
+    # ...but stage 2 saying "normal" in between IS a boundary, and it is the only
+    # recovery signal left. Measured: this recovers T033's match at no extra cost.
+    with_normal = [mk("traffic_congestion", 20.0, 0.9),
+                   mk("normal", 100.0, 0.9),
+                   mk("traffic_congestion", 200.0, 0.9)]
+    assert len(cluster_windows(with_normal)) == 2, \
+        "a normal verdict between two detections separates them"
 
     # CROSS-CLASS, T033's real shape: smoke then an altercation 16s later with
     # health depressed across the interval is one incident seen twice. The class
