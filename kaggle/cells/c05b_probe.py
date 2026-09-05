@@ -42,6 +42,50 @@ PROBE_CACHE_NAME = f"train_emb_{PROBE_FRAMES}x{int(PROBE_SPAN_SEC)}s.npz"
 # train/test mismatch it exists to remove. Both sides use this shape.
 
 
+# --- clips the organisers reissued labels for, and we now exclude ------------
+# data/train/wrong_way_driving/ holds 164 clips, all labelled wrong_way_driving.
+# The reissued ground_truth_corrected_v2.csv covers exactly those 164 and calls
+# 108 of them NORMAL - two thirds of the class was mislabelled. Three options,
+# all measured by refitting the cached embeddings (no re-embed, seconds):
+#
+#   handling of the 108        top-1   spec@0.90   times wrong_way predicted
+#   keep as wrong_way (before) 0.739     0.947              40
+#   relabel to normal          0.737     0.912              31
+#   DROP them                  0.767     0.947              19   <- chosen
+#
+# Relabelling looks like the obvious fix and is the worst of the three: it
+# pours 108 ambiguous road scenes into `normal`, which muddies the one class
+# whose precision protects our false-alarm record - specificity falls from
+# 0.947 to 0.912. Dropping them is better on every axis, and it halves how
+# often wrong_way_driving is predicted at all, which is the failure that costs
+# us most: on T025 the probe localises five real accidents at IoU 0.8+ and
+# calls every one of them wrong_way_driving.
+#
+# The honest reading is that these 108 are disputed rather than known. The
+# organisers changed their mind about them once, so asserting either label
+# trains on a guess; excluding them asserts nothing.
+PROBE_DISPUTED_IDS = frozenset([
+    "TR00001", "TR00002", "TR00004", "TR00005", "TR00006", "TR00007",
+    "TR00009", "TR00010", "TR00012", "TR00013", "TR00015", "TR00016",
+    "TR00017", "TR00019", "TR00020", "TR00021", "TR00022", "TR00027",
+    "TR00029", "TR00031", "TR00032", "TR00033", "TR00037", "TR00040",
+    "TR00043", "TR00044", "TR00045", "TR00047", "TR00049", "TR00052",
+    "TR00056", "TR00058", "TR00059", "TR00062", "TR00064", "TR00065",
+    "TR00066", "TR00068", "TR00069", "TR00072", "TR00073", "TR00074",
+    "TR00075", "TR00076", "TR00077", "TR00078", "TR00079", "TR00080",
+    "TR00081", "TR00082", "TR00083", "TR00084", "TR00085", "TR00087",
+    "TR00088", "TR00089", "TR00092", "TR00093", "TR00099", "TR00100",
+    "TR02761", "TR02771", "TR02790", "TR02798", "TR02806", "TR02814",
+    "TR02822", "TR02837", "TR02844", "TR02851", "TR02872", "TR02879",
+    "TR02893", "TR02899", "TR02911", "TR02917", "TR02923", "TR02935",
+    "TR02947", "TR02959", "TR02971", "TR02983", "TR02989", "TR02995",
+    "TR03007", "TR03025", "TR03031", "TR03037", "TR03049", "TR03061",
+    "TR03067", "TR03079", "TR03085", "TR03091", "TR03097", "TR03103",
+    "TR03109", "TR03115", "TR03121", "TR03127", "TR03139", "TR03145",
+    "TR03169", "TR03181", "TR03187", "TR03204", "TR03209", "TR03214",
+])
+
+
 def probe_clip_frames(path, t0=None, t1=None, n=PROBE_FRAMES,
                       span=PROBE_SPAN_SEC):
     """n frames spanning `span` seconds, centred on the labelled event.
@@ -89,7 +133,12 @@ def probe_training_rows() -> list[dict]:
     if GT_TRAIN.empty:
         return []
     rows = []
-    for cls, grp in GT_TRAIN.groupby("class_name"):
+    gt = GT_TRAIN[~GT_TRAIN["video_id"].astype(str).isin(PROBE_DISPUTED_IDS)]
+    n_dropped = len(GT_TRAIN) - len(gt)
+    if n_dropped:
+        print(f"  excluding {n_dropped} clips with disputed labels "
+              f"(see PROBE_DISPUTED_IDS)")
+    for cls, grp in gt.groupby("class_name"):
         grp = grp.dropna(subset=["path"])
         if len(grp) > PROBE_MAX_PER_CLASS:
             grp = grp.sample(PROBE_MAX_PER_CLASS, random_state=0)
@@ -203,6 +252,19 @@ def build_probe_embeddings(force: bool = False):
 
 
 PROBE_X, PROBE_Y, PROBE_IDS = build_probe_embeddings()
+
+# Apply the exclusion here too, not only at embed time. The cache predates this
+# decision and holds all 164 wrong_way clips, and re-embedding to drop 108 rows
+# would cost 40 minutes to achieve what one mask does - so filter whatever came
+# back, from cache or from a fresh pass.
+if PROBE_X is not None and len(PROBE_X):
+    _keep = np.array([str(v) not in PROBE_DISPUTED_IDS for v in PROBE_IDS])
+    if not _keep.all():
+        print(f"  dropping {int((~_keep).sum())} disputed clips from the cache "
+              f"({int(_keep.sum())} remain)")
+        PROBE_X = PROBE_X[_keep]
+        PROBE_Y = PROBE_Y[_keep]
+        PROBE_IDS = [v for v, k in zip(PROBE_IDS, _keep) if k]
 
 
 def fit_probe(X, y, C: float | None = None):
