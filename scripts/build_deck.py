@@ -56,12 +56,14 @@ WINDOWS = {"escalated": 76, "scan floor": 106, "last-resort": 8}
 def fig_cascade():
     """The architecture, drawn as what each tier throws away."""
     fig, ax = plt.subplots(figsize=(6.6, 3.05))
+    # measured on the 28-video evaluation run, not taken from config defaults:
+    # 5,657 frames sampled -> 3,888 survive the motion gate -> 760 reach the VLM
     stages = [
-        ("frames sampled @ 2 fps", 100, "#C7CAD1", INK),
-        ("motion gate rejects ~50%", 50, "#8FA3B0", INK),
-        ("SigLIP2 health score\n30 normal rules / 63 perturbed actions", 50, TEAL, "white"),
-        ("Qwen3-VL-4B verifies ~12%", 12, AMBER, "white"),
-        ("temporal aggregation\nmeasured event extent", 12, "#6B7280", "white"),
+        ("5,657 frames sampled @ 2 fps", 100, "#C7CAD1", INK),
+        ("motion gate drops 31%", 69, "#8FA3B0", INK),
+        ("SigLIP2 health score\n30 normal rules / 63 perturbed actions", 69, TEAL, "white"),
+        ("Qwen3-VL-4B sees 760 frames", 13, AMBER, "white"),
+        ("temporal aggregation\nmeasured event extent", 13, "#6B7280", "white"),
     ]
     y = 0
     for label, w, c, tc in stages:
@@ -254,9 +256,9 @@ def build():
     band(s1, 0.5, 5.92, 12.33, 0.012, RULE)
     stats = [
         ("0 / 6", "false alarms on normal\nvideos, every run"),
-        ("2.7x", "faster than realtime\non one T4 GPU"),
-        ("88%", "of frames never\nreach the VLM"),
-        ("3,207", "clips indexed across\n8 split archives"),
+        ("2.8x", "faster than realtime\non one T4 GPU"),
+        ("87%", "of frames never\nreach the VLM"),
+        ("83%", "of wall time is spent\ninside the VLM"),
         ("28", "blind eval videos,\nall answered"),
     ]
     for i, (big, small) in enumerate(stats):
@@ -274,37 +276,39 @@ def build():
     s2.shapes.add_picture(str(progression), Inches(0.45), Inches(1.24), width=Inches(6.1))
     s2.shapes.add_picture(str(duration), Inches(0.45), Inches(4.05), width=Inches(6.1))
 
-    textbox(s2, 6.85, 1.3, 6.0, 5.6, [
-        ("THE FINDING THAT MATTERED MOST",
+    textbox(s2, 6.85, 1.26, 6.0, 2.9, [
+        ("TWO FINDINGS THAT CHANGED THE DESIGN",
          {"size": 9.5, "bold": True, "color": AMBER, "space": 7}),
-        ("Our predicted events had a median length of 1.5 s. Real events have "
-         "a median of 20 s. We were reporting the width of a sampling window "
-         "as the duration of an incident, so IoU >= 0.5 was unreachable and 75 "
-         "of the 100 marks were mathematically out of reach. Walking the health "
-         "curve outward from each detection, to find where the scene returns to "
-         "normal, moved IoU matches from 0 to 2.",
-         {"size": 9.8, "color": MUTED, "space": 11}),
-        ("COVERAGE WAS A SILENT KILLER",
-         {"size": 9.5, "bold": True, "color": AMBER, "space": 7}),
-        ("The health threshold was calibrated on 5-30 s clips, then applied to "
-         "240-629 s videos from different cameras. Nine of 34 videos got zero "
-         "VLM looks; seven were genuinely anomalous, 41% of all our misses. A "
-         "periodic scan floor plus a guaranteed last-resort look took that to "
-         "zero.", {"size": 9.8, "color": MUTED, "space": 11}),
-    ])
-    s2.shapes.add_picture(str(coverage), Inches(6.85), Inches(4.28), width=Inches(6.0))
-
-    band(s2, 6.85, 5.62, 6.0, 0.012, RULE)
-    textbox(s2, 6.85, 5.78, 6.0, 1.4, [
-        ("WHAT IS STILL BROKEN, HONESTLY",
-         {"size": 9.5, "bold": True, "color": RED, "space": 6}),
-        ("Stage 2 is now the wall. On the blind set, six of the eight "
-         "high-value L2/L3 videos returned normal on every window, one of them "
-         "on all 35 looks, 26 of which stage 1 had flagged as its most abnormal "
-         "frames. Every non-normal verdict came back at exactly 0.95 or 0.98, "
-         "so our confidence thresholds have never once been exercised. The next "
-         "move is prompting, not plumbing.",
+        ("We were measuring the sampler, not the event.",
+         {"size": 10.2, "bold": True, "space": 1}),
+        ("Predicted events had a median length of 1.5 s; real ones last 20 s. "
+         "We were reporting the width of a sampling window as the duration of "
+         "an incident, so IoU >= 0.5 was unreachable and 75 of the 100 marks "
+         "were out of reach. Walking the health curve outward to find where the "
+         "scene returns to normal moved matches from 0 to 2.",
+         {"size": 9.5, "color": MUTED, "space": 9}),
+        ("Coverage was a silent killer.", {"size": 10.2, "bold": True, "space": 1}),
+        ("The threshold was calibrated on 5-30 s clips, then applied to "
+         "240-629 s videos from other cameras. Nine of 34 videos got zero VLM "
+         "looks; seven were genuinely anomalous, 41% of all misses. A scan "
+         "floor plus a guaranteed last-resort look took that to zero.",
          {"size": 9.5, "color": MUTED, "space": 0}),
+    ])
+    s2.shapes.add_picture(str(coverage), Inches(6.85), Inches(4.16), width=Inches(6.0))
+
+    band(s2, 6.85, 5.92, 6.0, 0.012, RULE)
+    textbox(s2, 6.85, 6.06, 6.0, 1.3, [
+        ("THE REAL BOTTLENECK, AND WHAT WE WOULD DO NEXT",
+         {"size": 9.5, "bold": True, "color": RED, "space": 6}),
+        ("Six of the eight high-value videos returned normal on every window - "
+         "one on all 35 looks, 26 of which stage 1 had flagged as its most "
+         "abnormal. The cause is measurable: the median clip we hand the VLM is "
+         "2 s wide, judging classes defined by persistence over 20 s. Next: "
+         "widen stage-2 windows to ~20 s (fewer, cheaper calls), then derive "
+         "confidence from self-consistency, because every non-normal verdict "
+         "came back at exactly 0.95 or 0.98 - our thresholds have never once "
+         "been exercised.",
+         {"size": 9.2, "color": MUTED, "space": 0}),
     ])
 
     out = OUT / "ahc_submission_2slide.pptx"
