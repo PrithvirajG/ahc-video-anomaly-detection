@@ -102,18 +102,34 @@ def probe_training_rows() -> list[dict]:
 
 
 def find_probe_cache():
-    """WORK first, then any attached dataset.
+    """WORK first, then anywhere under /kaggle/input.
 
-    /kaggle/working does not survive a fresh session, so a saved version of this
-    notebook can be re-attached as a dataset and the 15-minute embed skipped.
+    /kaggle/working does not survive a fresh session, so the cache gets
+    re-attached as a Kaggle Dataset or Model and found here instead of costing
+    another 40-minute embed. rglob covers both - a Dataset mounts at
+    /kaggle/input/<slug>/ and a Model at
+    /kaggle/input/models/<owner>/<slug>/other/default/1/ - so it does not matter
+    which one it was uploaded as.
+
+    The exact name is tried first. Failing that, any train_emb_*.npz is accepted
+    with a warning, because Kaggle sometimes renames on upload and a silent
+    40-minute re-embed is a worse outcome than a loud approximate match. Shape
+    and classes are validated by the caller either way.
     """
     local = WORK / PROBE_CACHE_NAME
     if local.exists():
         return local
     base = Path("/kaggle/input")
-    if base.exists():
-        for p in base.rglob(PROBE_CACHE_NAME):
-            return p
+    if not base.exists():
+        return None
+    for p in base.rglob(PROBE_CACHE_NAME):
+        return p
+    for p in sorted(base.rglob("train_emb_*.npz")):
+        print(f"  ! no {PROBE_CACHE_NAME} attached; using {p.name} instead.")
+        print(f"    Check it was built at {PROBE_FRAMES} frames over "
+              f"{PROBE_SPAN_SEC:.0f}s - a cache from different settings will "
+              f"fit and predict happily while meaning something else.")
+        return p
     return None
 
 
@@ -127,9 +143,28 @@ def build_probe_embeddings(force: bool = False):
     cached = None if force else find_probe_cache()
     if cached is not None:
         z = np.load(cached, allow_pickle=True)
-        print(f"probe cache: {cached}  ({len(z['y'])} clips, "
-              f"{z['X'].shape[1]}-d embeddings)")
-        return z["X"], z["y"], list(z["ids"])
+        X, y = z["X"], z["y"]
+        print(f"probe cache: {cached}")
+        print(f"  {len(y)} clips, {X.shape[1]}-d embeddings, "
+              f"{len(set(y.tolist()))} classes")
+        # Validate rather than trust. A cache is a file someone attached, and
+        # the failure modes are all silent: a truncated upload, a cache built at
+        # different settings, or labels outside the twelve would each fit and
+        # predict happily while meaning something else.
+        ok = True
+        if X.shape[0] != len(y):
+            print(f"  ! X has {X.shape[0]} rows against {len(y)} labels"); ok = False
+        if not np.isfinite(X).all():
+            print("  ! cache contains non-finite values"); ok = False
+        unknown = set(map(str, y.tolist())) - set(CLASSES)
+        if unknown:
+            print(f"  ! labels outside the twelve: {sorted(unknown)}"); ok = False
+        if len(y) < 200:
+            print(f"  ! only {len(y)} clips - too few to fit a 12-class probe"); ok = False
+        if not ok:
+            print("  ignoring this cache and rebuilding")
+        else:
+            return X, y, list(z["ids"])
 
     rows = probe_training_rows()
     if not rows:
