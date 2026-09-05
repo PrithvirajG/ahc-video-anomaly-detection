@@ -18,6 +18,8 @@ web/.vite/
 
 # --- the 15-17GB train/test pack and anything derived from it ---
 data/
+# --- the 1.33GB private evaluation pack (E001-E028), mirrored on Kaggle ---
+eval/
 models/hf/
 models/*.pt
 models/*.safetensors
