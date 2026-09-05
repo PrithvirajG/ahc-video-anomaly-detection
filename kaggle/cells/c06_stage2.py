@@ -321,11 +321,24 @@ def vlm_pick_class(pil_frames: list, options: list[str]) -> dict | None:
     """
     if not options:
         return None
+    # `options` narrows WHICH QUESTIONS get spelled out. It does NOT narrow the
+    # answer - the schema below offers all eleven.
+    #
+    # The first version of this function did narrow the answer, and it rebuilt
+    # the exact bug cell 6 exists to fix, one layer down. Measured on T025:
+    # traffic_accident was in the probe's top 3 for 1 window out of 12, so the
+    # re-ask could not answer it however clearly the frames showed one. The VLM
+    # dutifully picked stalled_or_broken_down_vehicle off the menu it was given,
+    # and five events that pass the IoU gate at 0.82-0.98 stayed wrong.
+    #
+    # A shortlist is a hint about where to look. The moment it reaches the reply
+    # schema it stops being a hint and starts deleting correct answers.
     lines = [
         "Something in these frames has been flagged as an incident by an "
         "automatic system, and you should assume it is right about that.",
         "",
-        "Your job is only to say WHICH of these it is:",
+        "Your job is to say WHICH incident it is. These are the most likely "
+        "candidates, but you may answer with any class in the list at the end:",
     ]
     for c in options:
         lines.append(f"\n[{c}]")
@@ -333,7 +346,7 @@ def vlm_pick_class(pil_frames: list, options: list[str]) -> dict | None:
     lines += [
         "",
         "Pick the single best fit even if you are unsure. Reply with JSON only:",
-        '{"class": "<one of: ' + ", ".join(options) + '>", '
+        '{"class": "<one of: ' + ", ".join(ANOMALY_CLASSES) + '>", '
         '"confidence": <0.0-1.0>, "description": "<one short sentence>"}',
     ]
     messages = [
@@ -357,7 +370,7 @@ def vlm_pick_class(pil_frames: list, options: list[str]) -> dict | None:
     # It may still answer "normal" despite not being offered it - that is the
     # model declining the premise, and the caller's probe evidence outranks a
     # refusal to choose, so treat it as no opinion rather than as a veto.
-    return d if d.get("class") in options else None
+    return d if d.get("class") in ANOMALY_CLASSES else None
 
 
 def parse_json_reply(text: str) -> dict:

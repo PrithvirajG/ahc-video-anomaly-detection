@@ -178,7 +178,11 @@ def process_video(path, cfg=None, verbose=False) -> dict:
             # against 0.884 for its top-3, so re-ask with those three and no
             # "normal" - the question it failed at was never "is anything
             # happening", it was "which of these is it".
-            pick = vlm_pick_class(pil, [c for c, _ in top3])
+            # Widen the HINTS as well: the probe top-3 was 91% confident and wrong
+            # on T025, so give the VLM the probe ranking plus stage 1's own,
+            # deduplicated. The schema already offers all eleven either way.
+            hints = list(dict.fromkeys([c for c, _ in top3] + list(cands)))[:6]
+            pick = vlm_pick_class(pil, hints)
             if pick:
                 chosen = pick["class"]
                 conf = max(0.5, min(float(pick.get("confidence", conf)), conf))
