@@ -1,0 +1,89 @@
+[project]
+name = "ahc-visual-intelligence"
+version = "0.1.0"
+description = "AHC Visual Intelligence Hackathon (05 Sep 2026) - real-time video anomaly detection with small VLMs"
+requires-python = ">=3.11,<3.13"
+
+dependencies = [
+  # --- config / hosted model providers -------------------------------------
+  # Same four interchangeable providers as the previous hackathon; `openai` is
+  # the client for all OpenAI-compatible endpoints (NVIDIA NIM, OpenRouter, Groq).
+  "python-dotenv",
+  "openai",
+  "google-genai",
+
+  # --- data acquisition -----------------------------------------------------
+  "gdown",            # pulls the train/test pack from the shared Drive mirrors
+  "kaggle",           # push/pull the GPU notebooks that do the heavy work
+  "huggingface-hub[hf-transfer]",
+  "requests",
+
+  # --- video / image --------------------------------------------------------
+  "opencv-python",
+  "av",               # PyAV: frame-accurate seeking, much faster than cv2 for clip sampling
+  "pillow",
+  "imageio-ffmpeg",
+
+  # --- numerics / tabular ---------------------------------------------------
+  "numpy",
+  "pandas",
+  "scipy",
+  "scikit-learn",     # metrics: AUC-ROC, AP, confusion matrices for the level scores
+  "pyarrow",
+
+  # --- local model inference ------------------------------------------------
+  # The 4GB GTX 1650 can run CLIP/SigLIP-class encoders and 2B VLMs in 4-bit,
+  # which is exactly the "lightweight always-on stage" this problem needs.
+  # Anything bigger (fine-tuning, 4B+ VLMs) goes to Kaggle/Colab/Modal.
+  "torch",
+  "torchvision",
+  "transformers",
+  "accelerate",
+  "safetensors",
+  "timm",
+  "open-clip-torch",  # CLIP / SigLIP2 variants with a single loader API
+  "sentencepiece",
+  "einops",
+  "qwen-vl-utils",    # frame sampling helpers shared by Qwen2.5-VL / Qwen3-VL
+  "faiss-cpu",        # kNN over frame embeddings (few-shot / memory-bank baselines)
+
+  # --- fine-tuning stack (importable locally, actually trained on T4s) -------
+  "peft",
+  "trl",
+  "datasets",
+
+  # --- serving / demo -------------------------------------------------------
+  "fastapi",
+  "uvicorn[standard]",
+  "websockets",       # pushes live alerts to the dashboard during the demo
+  "streamlit",
+  "gradio",
+  "plotly",
+  "matplotlib",
+
+  # --- CLI / ergonomics -----------------------------------------------------
+  "typer",
+  "rich",
+  "tqdm",
+  "pyyaml",
+]
+
+[dependency-groups]
+dev = ["pytest", "ruff", "ipykernel", "jupyter", "pypdf"]
+
+[tool.uv]
+package = false
+# torch/torchvision come from the CUDA 12.8 index, not PyPI: the default Windows
+# PyPI wheel is CPU-only, which would silently drop the local GPU. cu128 builds
+# include sm_75, which is what the GTX 1650 (Turing) needs.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[tool.ruff]
+line-length = 100

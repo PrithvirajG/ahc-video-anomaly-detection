@@ -1,0 +1,54 @@
+# --- secrets ---
+.env
+kaggle.json
+.kaggle/
+
+# --- python ---
+__pycache__/
+*.pyc
+.venv/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+
+# --- node ---
+node_modules/
+web/dist/
+web/.vite/
+
+# --- the 15-17GB train/test pack and anything derived from it ---
+data/
+models/hf/
+models/*.pt
+models/*.safetensors
+models/*.onnx
+models/*.engine
+
+# --- run artefacts ---
+runs/
+outputs/
+checkpoints/
+wandb/
+*.parquet
+*.faiss
+*.npy
+*.npz
+
+# --- media ---
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.srt
+
+# --- papers: PDFs and extracted text are re-downloadable, notes are not ---
+papers/*.pdf
+papers/raw/
+
+# --- kaggle notebook outputs pulled back down ---
+kaggle/*/output/
+kaggle/*/output_v*/
+kaggle/*/results/
+
+# --- organizer PDF: unclear redistribution rights, not needed to run the code ---
+AHC Visual Intelligence Hackathon.pdf

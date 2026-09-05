@@ -1,0 +1,12 @@
+# Primer-listed (AHC 05-Sep-2026 hackathon)
+CVPR2026        Alert-CLIP        Abnormality-aware Latent-Enhanced Representation Tuning of CLIP for VAD
+WACV2026        FineGrainedPrompting  Unlocking VLMs for VAD via Fine-Grained Prompting (Zou et al.)
+2510.16290      Cerberus          Real-Time Video Anomaly Detection via Cascaded Vision-Language Models
+2603.19098      TAU-R1            Visual Language Model for Traffic Anomaly Understanding
+
+# Carried over from the 22-Aug hackathon repo (directly relevant here)
+2603.13306      Compact_VLM_CCTV_Anomaly
+2404.01014      LAVAD             Training-free VAD with LLMs
+2412.01095      VERA              Verbalized learning of VAD prompts
+2502.14786      SigLIP2           Frame encoder candidate for the always-on stage
+2504.13181      Perception_Encoder
