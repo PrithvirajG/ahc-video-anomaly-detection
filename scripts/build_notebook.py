@@ -87,6 +87,30 @@ signs do the work.
 The threshold is **calibrated on known-normal training footage**, not guessed,
 which turns `escalate_pct` into a compute budget you can reason about."""),
 
+    ("c05b_probe.py", """## 5b — A learned prior, because the written one is inverted
+
+The health score above is the foundation under escalation, clustering and
+extent measurement. Measured against ground truth, it is **flat or backwards**
+on three of four test videos — anomalous frames sit at the *65th percentile* of
+their own video's health. A congested road looks like a road; a loiterer looks
+like a person.
+
+So this cell spends the **3,173 labelled training clips** we have so far used to
+compute exactly one number. Each clip is embedded once — 8 frames spanning 16s,
+centred on the labelled event — and a plain multinomial logistic regression is
+fitted over the frozen SigLIP2 vectors. The encoder stays frozen and zero-shot:
+no backprop, no fine-tuning, no GPU for the fit. Ninety-three English sentences
+are replaced by coefficients learned from examples.
+
+**8 frames over 16s, not 4 over 2s**, on both sides. Our inference window is ~2s
+while the median real event is 20s, so training wide and predicting narrow would
+rebuild the exact mismatch this is meant to remove.
+
+Embeddings are cached (`WORK`, then any attached dataset), because the expensive
+step is pixels→vectors and the step worth iterating on is the classifier over
+them. Nothing downstream consumes the probe yet — that decision waits on the
+held-out numbers printed here."""),
+
     ("c06_stage2.py", """## 6 — Stage 2: the small VLM
 
 Runs only on what stage 1 could not clear. **Qwen3-VL-4B**, not the 3B this

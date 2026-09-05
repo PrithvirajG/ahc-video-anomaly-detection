@@ -1,0 +1,262 @@
+# =============================================================================
+# 5b - A learned prior, because the written one is inverted
+# =============================================================================
+# Cell 5 scores a frame by comparing it to 30 hand-written normal rules and 63
+# perturbed actions. Measured on the five-video run, comparing health INSIDE a
+# real ground-truth event against health OUTSIDE it in the same video:
+#
+#     T026  inside +0.134  outside +0.608   separation +0.474   works
+#     T031  inside -0.085  outside -0.092   separation -0.007   flat
+#     T032  inside +0.531  outside +0.415   separation -0.116   INVERTED
+#     T025  inside +0.150  outside -0.097   separation -0.247   INVERTED
+#
+# On three of four videos the anomalous frames are as healthy as or HEALTHIER
+# than the rest of the video - they sit at the 65th percentile of their own
+# video's health. A congested road looks like a road; a loiterer looks like a
+# person. Only T026's road spill, a visible appearance change, separates.
+#
+# That one signal drives escalation, clustering and extent measurement, so it is
+# the foundation under most of the pipeline, and it is upside down.
+#
+# We also have 3,173 labelled training clips that we have so far used to compute
+# exactly one number (health_thresh). This cell spends them properly: embed each
+# clip once, then fit a plain multinomial logistic regression over the frozen
+# SigLIP2 embeddings. The encoder stays frozen and zero-shot - no backprop, no
+# fine-tuning, no GPU for the fit itself. What changes is that 93 English
+# sentences are replaced by coefficients learned from labelled examples.
+#
+# THIS CELL ONLY BUILDS AND MEASURES THE PROBE. Nothing downstream consumes it
+# yet, deliberately: how it should be used depends on how good it turns out to
+# be, and wiring it in before measuring it would make that unanswerable.
+
+import numpy as np
+
+PROBE_FRAMES = 8            # frames per training example
+PROBE_SPAN_SEC = 16.0       # ...spanning this much video
+PROBE_MAX_PER_CLASS = 300   # cap: normal has 973 clips and fire has 77
+PROBE_CACHE_NAME = f"train_emb_{PROBE_FRAMES}x{int(PROBE_SPAN_SEC)}s.npz"
+
+# 8 frames over 16s, not 4 over 2s, and the reason is the whole point of the
+# cell. Our inference window is ~2s wide while the median real event is 20s, so
+# a probe trained on wide clips and applied to 2s windows would rebuild the
+# train/test mismatch it exists to remove. Both sides use this shape.
+
+
+def probe_clip_frames(path, t0=None, t1=None, n=PROBE_FRAMES,
+                      span=PROBE_SPAN_SEC):
+    """n frames spanning `span` seconds, centred on the labelled event.
+
+    Anomaly clips carry start/end times, so we centre on the part that is
+    actually anomalous instead of averaging it away with surrounding normal
+    footage. Normal clips have no timings and use the middle of the clip.
+    Clips shorter than `span` just use everything they have.
+    """
+    dur = video_duration(path) or 0.0
+    if dur <= 0:
+        return []
+    if t0 is not None and t1 is not None and np.isfinite(t0) and np.isfinite(t1):
+        centre = (float(t0) + float(t1)) / 2
+    else:
+        centre = dur / 2
+    half = min(span, dur) / 2
+    lo = max(0.0, min(centre - half, dur - min(span, dur)))
+    hi = min(dur, lo + min(span, dur))
+    want = np.linspace(lo, max(lo, hi - 1e-3), n)
+
+    cap = cv2.VideoCapture(str(path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    out = []
+    for t in want:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(t * fps)))
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        h, w = frame.shape[:2]
+        if max(h, w) > CFG.max_side:
+            s = CFG.max_side / max(h, w)
+            frame = cv2.resize(frame, (int(w * s), int(h * s)))
+        out.append(to_pil(frame))
+    cap.release()
+    return out
+
+
+def probe_training_rows() -> list[dict]:
+    """One row per training clip: path, class, and where the anomaly is.
+
+    Capped per class. The cap is not only about time - normal has 973 clips
+    against fire's 77, and an unbalanced fit would learn to say "normal".
+    """
+    if GT_TRAIN.empty:
+        return []
+    rows = []
+    for cls, grp in GT_TRAIN.groupby("class_name"):
+        grp = grp.dropna(subset=["path"])
+        if len(grp) > PROBE_MAX_PER_CLASS:
+            grp = grp.sample(PROBE_MAX_PER_CLASS, random_state=0)
+        for _, r in grp.iterrows():
+            rows.append({"video_id": r["video_id"], "path": r["path"],
+                         "class_name": cls,
+                         "t0": r.get("start_time_sec"),
+                         "t1": r.get("end_time_sec")})
+    return rows
+
+
+def find_probe_cache():
+    """WORK first, then any attached dataset.
+
+    /kaggle/working does not survive a fresh session, so a saved version of this
+    notebook can be re-attached as a dataset and the 15-minute embed skipped.
+    """
+    local = WORK / PROBE_CACHE_NAME
+    if local.exists():
+        return local
+    base = Path("/kaggle/input")
+    if base.exists():
+        for p in base.rglob(PROBE_CACHE_NAME):
+            return p
+    return None
+
+
+def build_probe_embeddings(force: bool = False):
+    """Embed every (capped) training clip once and cache the result.
+
+    The expensive step is turning pixels into vectors; the step we actually want
+    to iterate on is fitting a classifier over them. Separating the two turns
+    one experiment per twenty minutes into twenty experiments per minute.
+    """
+    cached = None if force else find_probe_cache()
+    if cached is not None:
+        z = np.load(cached, allow_pickle=True)
+        print(f"probe cache: {cached}  ({len(z['y'])} clips, "
+              f"{z['X'].shape[1]}-d embeddings)")
+        return z["X"], z["y"], list(z["ids"])
+
+    rows = probe_training_rows()
+    if not rows:
+        print("no training ground truth - probe unavailable")
+        return None, None, None
+    print(f"embedding {len(rows)} training clips at {PROBE_FRAMES} frames over "
+          f"{PROBE_SPAN_SEC:.0f}s (one-off, cached to {WORK / PROBE_CACHE_NAME})")
+
+    X, y, ids = [], [], []
+    t0 = time.time()
+    for i, r in enumerate(rows, 1):
+        if i % 200 == 0 or i == len(rows):
+            el = time.time() - t0
+            print(f"  {i}/{len(rows)}  {el/60:.1f} min elapsed, "
+                  f"~{el/i*(len(rows)-i)/60:.1f} min left")
+        try:
+            frames = probe_clip_frames(r["path"], r["t0"], r["t1"])
+        except Exception as e:
+            print(f"  ! {r['video_id']}: {str(e).splitlines()[0][:90]}")
+            continue
+        if not frames:
+            continue
+        # mean-pool the clip's frames into one vector: the probe's unit is a
+        # clip, which is what makes persistence classes representable at all
+        emb = embed_images(frames).mean(0)
+        X.append(emb.detach().float().cpu().numpy())
+        y.append(r["class_name"])
+        ids.append(r["video_id"])
+
+    X = np.stack(X) if X else np.zeros((0, 768), dtype=np.float32)
+    y = np.array(y)
+    np.savez_compressed(WORK / PROBE_CACHE_NAME, X=X, y=y, ids=np.array(ids))
+    print(f"  wrote {WORK / PROBE_CACHE_NAME}  "
+          f"({X.nbytes / 1e6:.1f} MB, {time.time() - t0:.0f}s)")
+    return X, y, ids
+
+
+PROBE_X, PROBE_Y, PROBE_IDS = build_probe_embeddings()
+
+
+def fit_probe(X, y, C: float = 1.0):
+    """Multinomial logistic regression over frozen embeddings.
+
+    Balanced class weights because the cap does not fully level things (fire has
+    77 clips against normal's 300), and an unbalanced fit on this data learns
+    the majority answer - which is exactly the failure we are trying to remove.
+
+    Reported on a held-out split, not on the training data, because a probe that
+    memorises 3,000 embeddings would look excellent and predict nothing.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import classification_report, confusion_matrix
+
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25,
+                                          random_state=0, stratify=y)
+    # No multi_class= argument: it was deprecated in sklearn 1.5 and REMOVED in
+    # 1.9, where passing it is a TypeError rather than a warning. Multinomial is
+    # the default for multiclass with lbfgs, so dropping it changes nothing and
+    # works on both old and new versions - Kaggle's image moves without asking.
+    clf = LogisticRegression(max_iter=3000, C=C, class_weight="balanced")
+    clf.fit(Xtr, ytr)
+    pred = clf.predict(Xte)
+
+    print(f"\nprobe: {len(Xtr)} train / {len(Xte)} held out, "
+          f"{len(clf.classes_)} classes")
+    print(classification_report(yte, pred, zero_division=0, digits=3))
+
+    print("confusion (rows = truth, cols = predicted), held out:")
+    labels = list(clf.classes_)
+    cm = confusion_matrix(yte, pred, labels=labels)
+    short = [c[:14] for c in labels]
+    print("      " + "".join(f"{s:>6}" for s in short))
+    for name, row in zip(short, cm):
+        print(f"{name:>14}" + "".join(f"{v:>6d}" for v in row))
+
+    # The number that matters for us specifically: can it tell anomalous from
+    # normal at all? Class confusion is survivable, saying "normal" is not.
+    anom_t = np.array([t != "normal" for t in yte])
+    anom_p = np.array([p != "normal" for p in pred])
+    tp = int((anom_t & anom_p).sum()); fn = int((anom_t & ~anom_p).sum())
+    fp = int((~anom_t & anom_p).sum()); tn = int((~anom_t & ~anom_p).sum())
+    print(f"\nanomalous vs normal (the decision stage 1 actually makes):")
+    print(f"  recall {tp / max(tp + fn, 1):.3f}   "
+          f"precision {tp / max(tp + fp, 1):.3f}   "
+          f"TP={tp} FN={fn} FP={fp} TN={tn}")
+    print(f"  for comparison, the written health score is INVERTED on 3 of the "
+          f"4 test videos measured")
+    return clf
+
+
+PROBE = fit_probe(PROBE_X, PROBE_Y) if PROBE_X is not None and len(PROBE_X) else None
+
+
+def probe_predict(emb) -> dict:
+    """{class_name: probability} for one window's frames.
+
+    Takes the same mean-pooled shape the probe was trained on, so callers must
+    pass frames spanning PROBE_SPAN_SEC - handing it a 2s window would be the
+    train/test mismatch this cell exists to avoid.
+    """
+    if PROBE is None:
+        return {}
+    v = emb.mean(0) if hasattr(emb, "mean") and getattr(emb, "ndim", 1) > 1 else emb
+    v = v.detach().float().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)
+    p = PROBE.predict_proba(v.reshape(1, -1))[0]
+    # str() on the keys: sklearn hands back numpy.str_, which subclasses str and
+    # so passes every type check, then serialises into JSON as an object rather
+    # than a string. Cast at the boundary instead of debugging it in the arena
+    # submission file.
+    return {str(c): float(v) for c, v in zip(PROBE.classes_, p.tolist())}
+
+
+def probe_anomaly(emb) -> float:
+    """P(anything is wrong) in [0, 1]. Higher is worse - note this is the
+    OPPOSITE sign to health(), which is higher-is-better. Kept explicit rather
+    than mimicking the health convention, because silently reusing that sign is
+    how the inverted signal went unnoticed for so long."""
+    p = probe_predict(emb)
+    return float(1.0 - p.get("normal", 1.0)) if p else 0.0
+
+
+def probe_shortlist(emb, k: int = 5) -> list[str]:
+    """The k most likely ANOMALY classes, learned rather than written."""
+    p = probe_predict(emb)
+    if not p:
+        return []
+    ranked = sorted(((c, v) for c, v in p.items() if c != "normal"),
+                    key=lambda kv: -kv[1])
+    return [c for c, _ in ranked[:k]]
