@@ -37,10 +37,27 @@ def add_scan_floor(windows: list[list[dict]], kept: list[dict],
     """
     cfg = cfg or CFG
     out = [(w, "escalated") for w in windows]
-    if not (cfg.scan_floor_enabled and duration > cfg.scan_floor_min_video_sec):
-        return out
     if not kept:
         return out
+
+    def _never_looked():
+        """Never report a video normal without the VLM having seen it once.
+
+        Measured: 9 videos produced zero windows - no escalation, and too short
+        for the interval floor - and SEVEN of those nine were genuinely
+        anomalous (T007 accident, T008/T009 congestion, T010 stalled vehicle,
+        T022 fighting, T023/T024 loitering). That was 41% of all our misses
+        coming from videos we simply never examined. Nine extra VLM calls, ~50
+        seconds, is a trivial price for removing a whole failure mode.
+
+        The frames offered are the LOWEST-HEALTH ones available, so the single
+        look gets the most suspicious moment rather than an arbitrary one.
+        """
+        worst = sorted(kept, key=lambda k: k["health"])[:cfg.vlm_frames]
+        return [(sorted(worst, key=lambda k: k["t"]), "last-resort")]
+
+    if not (cfg.scan_floor_enabled and duration > cfg.scan_floor_min_video_sec):
+        return out or _never_looked()
 
     covered = [(w[0]["t"], w[-1]["t"]) for w in windows]
     step = cfg.scan_floor_interval_sec
@@ -60,7 +77,7 @@ def add_scan_floor(windows: list[list[dict]], kept: list[dict],
         if picked and abs(picked[0]["t"] - centre) <= step:   # slot has real frames
             out.append((picked, "scan"))
         t = slot_end
-    return out
+    return out or _never_looked()
 
 
 def pick_frames(window: list[dict], n: int) -> list[dict]:
