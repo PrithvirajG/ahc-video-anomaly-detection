@@ -27,7 +27,15 @@
 #     match; the rest count AGAINST you - our per-class merge_gap in cell 7 is
 #     exactly what keeps this from happening, so don't loosen it casually
 
-MANIFEST_PATH = WORK / "manifest.json"     # drop the arena's file here once fetched
+# In eval mode the manifest ships inside the dataset itself, so there is nothing
+# to fetch by hand and no chance of scoring against a stale copy. A file dropped
+# into WORK still wins, which is the escape hatch if the arena reissues one.
+_WORK_MANIFEST = WORK / "manifest.json"
+MANIFEST_PATH = (_WORK_MANIFEST if _WORK_MANIFEST.exists()
+                 else (EVAL_MANIFEST_PATH if MODE == "eval" and EVAL_MANIFEST_PATH
+                       else _WORK_MANIFEST))
+print(f"manifest: {MANIFEST_PATH}"
+      f"{'' if MANIFEST_PATH.exists() else '  (absent - falling back to local truth)'}")
 
 
 def load_manifest() -> dict[str, int]:

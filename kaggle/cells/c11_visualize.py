@@ -39,6 +39,12 @@ def put_text(frame, lines, origin=(10, 30), color=(0, 0, 255), scale=0.7):
 
 
 def gt_label(video_id: str) -> str:
+    # "unknown", not "normal". On the eval pack every class_name is NA, and the
+    # old code's `else "normal"` would have quietly asserted that all 28 videos
+    # are normal - colouring every prediction red as a false positive and
+    # inverting the meaning of the whole gallery.
+    if not HAS_TRUTH:
+        return "unknown (no truth in this pack)"
     rows = GT_TEST[GT_TEST.video_id == video_id]
     if rows.empty:
         return "no ground truth"
@@ -53,7 +59,14 @@ def pred_row(video_id: str) -> dict | None:
 
 # --- controlled still gallery --------------------------------------------
 # Edit freely. Nothing outside this list gets rendered.
-GALLERY_VIDEO_IDS = ["T005", "T012", "T016", "T009", "T033"]
+# Practice ids are T0xx and eval ids are E0xx, so a single hard-coded list
+# renders an empty gallery in one of the two modes. Both are spelled out; edit
+# whichever applies. In eval mode this deliberately picks one video per level
+# plus the longest, because with cell 9 unable to score anything these frames
+# are the only check on the run before it is submitted.
+GALLERY_VIDEO_IDS = (["E003", "E017", "E021", "E025", "E028"] if MODE == "eval"
+                     else ["T005", "T012", "T016", "T009", "T033"])
+GALLERY_VIDEO_IDS = [v for v in GALLERY_VIDEO_IDS if v in VIDEO_PATHS]
 
 for vid in GALLERY_VIDEO_IDS:
     path = VIDEO_PATHS.get(vid)
@@ -65,14 +78,21 @@ for vid in GALLERY_VIDEO_IDS:
         ev = max(events, key=lambda e: e["peak_confidence"])
         t = (ev["start_time_sec"] + ev["end_time_sec"]) / 2
         pred_txt = f"pred: {ev['class_name']} ({ev['confidence']:.2f})"
-        color = (0, 180, 0) if ev["class_name"] in gt_label(vid) else (0, 0, 255)
+        # blue = "we cannot say if this is right"; green/red only where truth exists
+        color = ((0, 140, 200) if not HAS_TRUTH else
+                 (0, 180, 0) if ev["class_name"] in gt_label(vid) else (0, 0, 255))
     else:
         gt_rows = GT_TEST[GT_TEST.video_id == vid]
         t = (gt_rows.iloc[0].start_time_sec if not gt_rows.empty
              and pd.notna(gt_rows.iloc[0].start_time_sec) else video_duration(path) / 2)
-        pred_txt = "pred: normal" + (" (missed)" if vid in set(
-            GT_TEST[GT_TEST.is_anomaly == True].video_id) else "")
-        color = (0, 140, 255) if "missed" in pred_txt else (0, 180, 0)
+        # This one does not crash on an all-NA column - pandas returns an empty
+        # frame - but "not missed" would then be an assertion we cannot support,
+        # so the truthless case short-circuits rather than relying on that.
+        missed = HAS_TRUTH and vid in set(
+            GT_TEST[GT_TEST.is_anomaly == True].video_id)
+        pred_txt = "pred: normal" + (" (missed)" if missed else "")
+        color = (0, 140, 200) if not HAS_TRUTH else (
+            (0, 140, 255) if missed else (0, 180, 0))
 
     frame = grab_frame_at(path, t)
     if frame is None:
@@ -91,7 +111,7 @@ for vid in GALLERY_VIDEO_IDS:
 
 
 # --- one video, played back with the pipeline's own reasoning overlaid ------
-LIVE_CHECK_VIDEO_ID = "T033"
+LIVE_CHECK_VIDEO_ID = "E028" if MODE == "eval" else "T033"
 
 
 def make_live_check_video(video_id: str, cfg=None) -> Path | None:

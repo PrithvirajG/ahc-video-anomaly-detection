@@ -19,7 +19,11 @@ RUNS.mkdir(parents=True, exist_ok=True)
 class Config:
     # a list, not a path: an upload of several zips extracts to several sibling
     # trees on Kaggle, and the pack is their union (see cell 2)
-    data_roots: list = field(default_factory=lambda: list(DATA_ROOTS))
+    # In eval mode this holds BOTH packs: the eval tree supplies the videos to
+    # answer for, the practice tree supplies the known-normal footage cell 5
+    # calibrates on. Indexing them together is why no cell below needs to know
+    # which pack a given video came from.
+    data_roots: list = field(default_factory=lambda: list(DATA_ROOTS) + list(EVAL_ROOTS))
 
     # --- sampling -------------------------------------------------------
     sample_fps: float = 2.0        # frames/s pulled off the decoder
@@ -136,8 +140,65 @@ def load_ground_truth(split: str) -> pd.DataFrame:
     return gt
 
 
+EVAL_MANIFEST_PATH = None
+for _r in EVAL_ROOTS:
+    _m = _r / "manifest.json"
+    if _m.exists():
+        EVAL_MANIFEST_PATH = _m
+        break
+
+
+def load_eval_index() -> pd.DataFrame:
+    """Build a GT_TEST-shaped frame for the evaluation pack.
+
+    This is the hinge the whole flag turns on. It returns the SAME columns
+    load_ground_truth returns - video_id, level, path, and the truth columns
+    class_name / start_time_sec / end_time_sec / is_anomaly - except the truth
+    columns are empty, because the pack ships none.
+
+    Keeping the shape identical is deliberate. Cells 8, 10 and 11 all consume
+    GT_TEST, and every one of them keeps working with no branch of its own; the
+    alternative was a MODE check in five places, each of which could drift. The
+    truth columns are present-but-NaN rather than absent so that cell 9 can ask
+    "is there truth here?" and get a clean answer instead of a KeyError.
+
+    Level comes from the manifest, not the folder name, because the manifest is
+    what the arena scores against - and duration_sec comes from it too, which is
+    more authoritative than our own decode.
+    """
+    rows = []
+    if EVAL_MANIFEST_PATH is not None:
+        man = json.loads(EVAL_MANIFEST_PATH.read_text())
+        for v in man.get("videos", man if isinstance(man, list) else []):
+            rows.append({"video_id": v["video_id"],
+                         "level": int(v.get("level", v.get("difficulty", 1))),
+                         "duration_sec": float(v.get("duration_sec", 0)) or None})
+    else:
+        # No manifest: fall back to the tree itself. Levels come from the folder
+        # name here, which is the best available and matches how it was shipped.
+        print("  ! no manifest.json in the eval pack - falling back to the "
+              "L1/L2/L3 folder names for levels")
+        for r in EVAL_ROOTS:
+            for lv in sorted(EVAL_LEVEL_DIRS):
+                for mp4 in sorted((r / lv).rglob("*.mp4")) if (r / lv).is_dir() else []:
+                    rows.append({"video_id": mp4.stem, "level": int(lv[1]),
+                                 "duration_sec": None})
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).drop_duplicates("video_id").reset_index(drop=True)
+    for col in ("class_name", "start_time_sec", "end_time_sec", "is_anomaly"):
+        df[col] = pd.NA
+    df["path"] = df["video_id"].map(VIDEO_PATHS)
+    return df
+
+
 GT_TRAIN = load_ground_truth("train")
-GT_TEST = load_ground_truth("test")
+GT_TEST = load_eval_index() if MODE == "eval" else load_ground_truth("test")
+
+# Truth present or not is asked once, here, and answered everywhere else by
+# reading this - cells 9 and 11 must not re-derive it from MODE, or the two
+# could disagree.
+HAS_TRUTH = (not GT_TEST.empty) and GT_TEST["class_name"].notna().any()
 
 print(f"\nindexed {len(VIDEO_PATHS)} videos across {len(CFG.data_roots)} root(s)")
 for name, gt in (("train", GT_TRAIN), ("test", GT_TEST)):
@@ -150,3 +211,17 @@ for name, gt in (("train", GT_TRAIN), ("test", GT_TEST)):
     unknown = set(gt.get("class_name", pd.Series(dtype=str)).dropna()) - set(CLASSES)
     if unknown:
         print(f"  ! labels outside the twelve: {sorted(unknown)}")
+
+if MODE == "eval":
+    print()
+    print(f"EVAL SET: {len(GT_TEST)} videos to answer for"
+          + (f", manifest {EVAL_MANIFEST_PATH.name}" if EVAL_MANIFEST_PATH else ""))
+    if not GT_TEST.empty:
+        for _lv, _n in sorted(GT_TEST["level"].value_counts().items()):
+            _d = GT_TEST[GT_TEST["level"] == _lv]["duration_sec"]
+            print(f"  L{_lv}: {_n:2d} videos, {_d.sum() / 60:5.1f} min")
+        _miss = GT_TEST[GT_TEST["path"].isna()]["video_id"].tolist()
+        if _miss:
+            print(f"  ! {len(_miss)} manifest video(s) with no mp4 on disk: "
+                  f"{_miss[:8]}{' ...' if len(_miss) > 8 else ''}")
+    print(f"  ground truth: {'present' if HAS_TRUTH else 'ABSENT (cell 9 will skip)'}")

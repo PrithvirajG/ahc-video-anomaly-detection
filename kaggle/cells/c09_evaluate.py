@@ -128,8 +128,22 @@ def evaluate(pred: pd.DataFrame, gt: pd.DataFrame) -> dict:
             "tp": tp, "fp": fp, "fn": fn, "tn": tn}
 
 
-METRICS = evaluate(PRED, GT_TEST if not GT_TEST.empty else GT_TRAIN)
-(RUNS / "metrics.json").write_text(json.dumps(METRICS, indent=2))
+# Scoring needs labels. The eval pack ships none - deliberately - so there is
+# nothing here to compute and a fabricated zero would be worse than a skip: it
+# would look like a real measurement in the metrics file.
+if not HAS_TRUTH:
+    METRICS = None
+    print("MODE='eval' - no ground truth in this pack, so there is nothing to")
+    print("score. Recall/F1/IoU are unavailable BY DESIGN, not by failure.")
+    print()
+    print("What to check instead, before submitting:")
+    print("  - cell 8's per-video table: does every video get a plausible verdict?")
+    print("  - cell 8's window counts: is anything getting zero looks?")
+    print("  - cell 10's validator: schema, levels and timestamps")
+    print("  - cell 11: eyeball a few frames and one full video replay")
+else:
+    METRICS = evaluate(PRED, GT_TEST)
+    (RUNS / "metrics.json").write_text(json.dumps(METRICS, indent=2))
 
 
 # The arena submission is a different, stricter schema (JSON, private video

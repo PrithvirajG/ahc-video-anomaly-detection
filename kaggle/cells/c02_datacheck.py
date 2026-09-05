@@ -11,6 +11,30 @@
 
 from pathlib import Path
 
+# =============================================================================
+# WHICH DATASET DOES THIS RUN USE?
+# =============================================================================
+#   "practice" - the public train/test pack. 34 test videos named T0xx, with
+#                ground truth, so cell 9 can score the run and we can iterate.
+#   "eval"     - the private evaluation pack. 28 videos named E0xx under
+#                L1/L2/L3, NO ground truth (withheld on purpose), so cell 9
+#                cannot score anything and cell 10's JSON is the only output.
+#
+# Only this line changes between the two. Everything downstream reads GT_TEST,
+# which cell 3 builds from whichever source this selects - so the pipeline
+# itself has no idea which mode it is in, and practice mode behaves exactly as
+# it did before this flag existed.
+#
+# In "eval", attach BOTH datasets on Kaggle:
+#     prithvirajgotepatil/ahc-visual-intelligence-eval         <- the videos
+#     prithvirajgotepatil/ahc-visual-intelligence-train-test   <- calibration
+# Cell 5 measures health_thresh on known-normal TRAINING footage. Without the
+# second dataset that threshold stays unset and cells 7/8/11 silently fall back
+# to a hard-coded -0.4 that was never measured on anything.
+MODE = "eval"        # "practice" | "eval"
+
+assert MODE in ("practice", "eval"), f"MODE must be 'practice' or 'eval', not {MODE!r}"
+
 # The twelve label strings. Scoring compares the string, so these are copied
 # exactly from the problem statement and must never be "tidied up".
 CLASSES = [
@@ -87,6 +111,51 @@ def find_data_roots(max_depth: int = 8) -> list[Path]:
     return roots
 
 
+EVAL_LEVEL_DIRS = {"L1", "L2", "L3"}
+
+
+def find_eval_roots(max_depth: int = 8) -> list[Path]:
+    """Find every directory holding the evaluation pack's L1/L2/L3 levels.
+
+    The evaluation pack has a different shape from the train/test pack, and the
+    difference is silent rather than loud: no train/, no test/, and no
+    ground_truth.csv anywhere - its README says truth is withheld on purpose -
+    just L1/, L2/, L3/, each containing videos/ and videos.csv.
+
+    find_data_roots() above matches on a train/ or test/ sibling, so it returns
+    [] for this tree. That is not an error anyone sees: it indexes zero videos
+    and the run completes having processed nothing. Hence a second finder rather
+    than a looser first one - the two shapes stay distinguishable, which is what
+    lets both packs be attached at once in eval mode.
+    """
+    roots: list[Path] = []
+
+    def walk(d: Path, depth: int):
+        if depth > max_depth:
+            return
+        try:
+            subdirs = [p for p in d.iterdir() if p.is_dir()]
+        except OSError:
+            return
+        names = {p.name for p in subdirs}
+        # every level need not be present - a partial mount is still a root,
+        # and saying so beats reporting "no data" for a tree that has videos
+        if names & EVAL_LEVEL_DIRS:
+            r = d.resolve()
+            if r not in roots:
+                roots.append(r)
+            return
+        for p in subdirs:
+            if p.name in ("videos", "__MACOSX", ".ipynb_checkpoints"):
+                continue
+            walk(p, depth + 1)
+
+    for base in (Path("/kaggle/input"), WORK / "eval", Path("eval")):
+        if base.exists():
+            walk(base, 0)
+    return roots
+
+
 def looks_like_drive_html(p: Path) -> bool:
     """Kaggle's 'link a Google Drive URL' importer cannot authenticate and cannot
     walk a folder - it does a plain GET and stores whatever comes back. Pointed
@@ -104,6 +173,13 @@ def looks_like_drive_html(p: Path) -> bool:
 
 DATA_ROOTS = find_data_roots()
 DATA_ROOT = DATA_ROOTS[0] if DATA_ROOTS else (WORK / "data")   # first, for messages
+EVAL_ROOTS = find_eval_roots()
+
+print("=" * 74)
+print(f"  MODE: {MODE.upper()}" + ("   - private evaluation pack, no ground truth"
+                                   if MODE == "eval" else
+                                   "   - public train/test pack, scored by cell 9"))
+print("=" * 74)
 
 print("attached under /kaggle/input:")
 root = Path("/kaggle/input")
@@ -147,14 +223,63 @@ print(f"train     : {len(found_classes)}/12 class folders")
 print(f"test      : {n_test} clips")
 print(f"ground_truth.csv files: {len(gt_files)}")
 
-DATA_OK = bool(videos) and not missing and n_test > 0 and len(gt_files) > 0
+# --- the evaluation pack, audited separately -------------------------------
+# Counted per level, not in total, because a silently missing level is the
+# failure that costs whole marks: L2 and L3 carry 75 of the 100 points between
+# just eight videos, so eight absent files is not a rounding error.
+n_eval = 0
+if EVAL_ROOTS:
+    print()
+    print(f"eval roots: {len(EVAL_ROOTS)}")
+    for r in EVAL_ROOTS:
+        try:
+            shown = r.relative_to("/kaggle/input")
+        except ValueError:
+            shown = r
+        per = {lv: len(list((r / lv).rglob("*.mp4")))
+               for lv in sorted(EVAL_LEVEL_DIRS) if (r / lv).is_dir()}
+        n_eval += sum(per.values())
+        print(f"  {str(shown):46s} " + "  ".join(f"{k}:{v}" for k, v in per.items()))
+    print(f"eval videos: {n_eval}")
 
-if missing:
+if MODE == "eval":
+    # An absent ground_truth.csv is the EXPECTED state here, not a fault, so
+    # requiring one would reject a perfectly good mount. The practice pack is
+    # still wanted - for calibration only - hence a warning, not a stop.
+    DATA_OK = n_eval > 0
+    if not gt_files:
+        print()
+        print("  ! the train/test pack is NOT attached. Cell 5 calibrates")
+        print("    health_thresh on known-normal TRAINING footage, so without it")
+        print("    the threshold stays unset and cells 7/8/11 fall back to a")
+        print("    hard-coded -0.4 that was never measured on this data.")
+        print("    Add data -> prithvirajgotepatil/ahc-visual-intelligence-train-test")
+else:
+    DATA_OK = bool(videos) and not missing and n_test > 0 and len(gt_files) > 0
+
+if missing and MODE != "eval":
     print(f"  ! missing class folders: {sorted(missing)}")
-if extra:
+if extra and MODE != "eval":
     print(f"  ! unexpected folders: {sorted(extra)}")
 
-if DATA_OK:
+if MODE == "eval" and DATA_OK:
+    print()
+    print(f"DATA OK - {n_eval} evaluation videos."
+          + ("" if gt_files else "  (no calibration pack - see the warning above)"))
+    print("      Cell 9 cannot score this run: the pack ships no ground truth.")
+    print("      Cell 10's arena_submission.json is the output that matters.")
+elif MODE == "eval":
+    print("""
+DATA NOT USABLE. MODE is "eval" but no L1/L2/L3 tree was found.
+
+Attach this one:  Add data -> Your Datasets ->
+                  prithvirajgotepatil/ahc-visual-intelligence-eval
+
+It holds the 28-video private evaluation pack (E001-E028, L1 20 / L2 4 / L3 4,
+1.33 GB, 47 minutes of footage) and its manifest.json. Attach the train-test
+pack alongside it so cell 5 can still calibrate the threshold.
+""")
+elif DATA_OK:
     print(f"\nDATA OK - all twelve classes, {n_test} test clips, ground truth present.")
     if len(DATA_ROOTS) > 1:
         print(f"      (assembled from {len(DATA_ROOTS)} extracted archives - the pack was")
