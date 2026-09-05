@@ -31,7 +31,7 @@ from pathlib import Path
 # Cell 5 measures health_thresh on known-normal TRAINING footage. Without the
 # second dataset that threshold stays unset and cells 7/8/11 silently fall back
 # to a hard-coded -0.4 that was never measured on anything.
-MODE = "eval"        # "practice" | "eval"
+MODE = "practice"    # "practice" | "eval"
 
 assert MODE in ("practice", "eval"), f"MODE must be 'practice' or 'eval', not {MODE!r}"
 

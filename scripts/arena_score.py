@@ -89,7 +89,7 @@ def score_timed(pred: dict[str, dict], gt: pd.DataFrame, level: int) -> dict:
     """Per-event, class-correct AND IoU >= 0.5. One prediction per truth event."""
     g = gt[(gt.level == level) & gt.start_time_sec.notna()]
     normal_ids = set(gt[(gt.level == level) & (gt.class_name == "normal")].video_id)
-    found = fa = 0
+    found = fa = wrongclass = 0
     per_video, matched_events = [], []
     for vid in sorted(set(g.video_id) | normal_ids):
         truth = g[g.video_id == vid]
@@ -113,13 +113,40 @@ def score_timed(pred: dict[str, dict], gt: pd.DataFrame, level: int) -> dict:
                 if any(iou(e["start_time_sec"], e["end_time_sec"],
                            t.start_time_sec, t.end_time_sec) > 0 for e in evs):
                     v_wrong += 1
+        # The arena's timeline splits unmatched predictions into two colours,
+        # and the leaderboard folds them back together. Both are reported here
+        # because reconciling our numbers against the arena needs both views:
+        #
+        #   violet "wrong class"  - overlaps a real event, named it wrongly
+        #   red    "false alarm"  - matched nothing, INCLUDING a right-class
+        #                           prediction whose IoU missed the 0.5 gate
+        #                           (T031: congestion 9-311s over a real
+        #                           235-360s congestion is red, not violet)
+        #
+        # Verified against the practice timeline for arena_submission (2):
+        # arena reported 2 matched, 2 wrong-class, 5 false-alarm; this scorer
+        # produces 2 matched and 7 unmatched, and 2 + 5 = 7.
+        v_wrongclass = v_fa = 0
+        for i, e in enumerate(evs):
+            if i in used:
+                continue
+            overlapping = [t for _, t in truth.iterrows()
+                           if iou(e["start_time_sec"], e["end_time_sec"],
+                                  t.start_time_sec, t.end_time_sec) > 0]
+            if overlapping and all(e["class_name"] != t.class_name for t in overlapping):
+                v_wrongclass += 1
+            else:
+                v_fa += 1
         unmatched = len(evs) - len(used)
         fa += unmatched
+        wrongclass += v_wrongclass
         per_video.append(dict(video_id=vid, level=level,
                               truth=len(truth), pred=len(evs),
-                              found=v_found, near_miss=v_wrong, fa=unmatched,
+                              found=v_found, near_miss=v_wrong,
+                              wrongclass=v_wrongclass, fa=v_fa,
+                              unmatched=unmatched,
                               is_normal=vid in normal_ids))
-    return dict(found=found, total=len(g), fa=fa,
+    return dict(found=found, total=len(g), fa=fa, wrongclass=wrongclass,
                 per_video=per_video, matched=matched_events)
 
 
@@ -184,6 +211,18 @@ def main() -> None:
         print(f"{name:4} {m:6.1f} /{cap:5.0f}  {100*p:5.0f}% {100*r:5.0f}%  "
               f"{f:4d}/{t:<4d}  {fa:5d}")
     print(f"{'':4} {total:6.1f} / 100.0   <- estimated, see the docstring")
+    print()
+    print("  P/R use the LEADERBOARD convention: FA counts every unmatched")
+    print("  prediction, wrong-class ones included. Verified against the arena's")
+    print("  own practice timeline - it reported 2 matched / 2 wrong-class /")
+    print("  5 false-alarm where this reports 2 matched / 7 FA, and 2+5 = 7.")
+    if not timed[2]["per_video"] or any(pv["video_id"] == "T028"
+                                        for pv in timed[2]["per_video"]):
+        print()
+        print("  ! D2 denominator differs from the arena by design: our CSV gives")
+        print("    T028 four events and the arena's practice timeline omits T028")
+        print("    entirely (14 D2 events there, 18 here). No corrected CSV exists,")
+        print("    so D2 recall here reads ~4 events pessimistic against the arena.")
 
     print()
     print("-" * 78)
@@ -201,11 +240,14 @@ def main() -> None:
         print("-" * 78)
         print(f"D{lv} detail (event level, class + IoU>=0.5)")
         print("-" * 78)
+        print("  (arena colours: matched=green  wrong-class=violet  "
+              "false-alarm=red;  leaderboard FA = wrong-class + false-alarm)")
         for pv in s["per_video"]:
             tag = "NORMAL" if pv["is_normal"] else ""
             print(f"  {pv['video_id']}  truth {pv['truth']:2d}  pred {pv['pred']:2d}"
-                  f"  found {pv['found']:2d}  near-miss {pv['near_miss']:2d}"
-                  f"  FA {pv['fa']:2d}  {tag}")
+                  f"  matched {pv['found']:2d}  wrong-class {pv['wrongclass']:2d}"
+                  f"  false-alarm {pv['fa']:2d}  missed {pv['truth'] - pv['found']:2d}"
+                  f"  {tag}")
             if args.timeline and not pv["is_normal"]:
                 tr = gt[(gt.video_id == pv["video_id"]) & gt.start_time_sec.notna()]
                 dur = (pred.get(pv["video_id"]) or {}).get("duration_sec") \

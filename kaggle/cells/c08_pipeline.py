@@ -205,6 +205,12 @@ def process_video(path, cfg=None, verbose=False) -> dict:
         # raw per-window verdicts, kept so aggregation can be re-tuned offline in
         # seconds instead of an 8-minute GPU re-run per experiment
         "window_verdicts": results,
+        # ...and the curve those verdicts were measured against. Without it an
+        # offline replay can reproduce the CLUSTERING but not the EXTENT, since
+        # both now consult the curve - which made the last round of sweeps
+        # unable to test the thing they were sweeping. ~600 floats per video,
+        # rounded to keep the JSON readable.
+        "health_curve": [[round(t, 2), round(h, 4)] for t, h in (curve or [])],
         "escalation_rate": round(len(windows) and sum(len(w) for w in windows)
                                  / max(len(kept), 1) or 0.0, 4),
         "events": events,
@@ -232,9 +238,17 @@ def process_video(path, cfg=None, verbose=False) -> dict:
 # --- run over the public test set --------------------------------------------
 # 34 videos / ~56 min, with ground truth published, so this is the only honest
 # read on whether any of the above works before the private evaluation.
-def run_split(gt: pd.DataFrame, limit: int | None = None, cfg=None) -> pd.DataFrame:
+def run_split(gt: pd.DataFrame, limit: int | None = None, cfg=None,
+              only: list[str] | None = None) -> pd.DataFrame:
     cfg = cfg or CFG
     vids = gt.drop_duplicates("video_id")[["video_id", "path"]].dropna(subset=["path"])
+    if only:
+        want = list(dict.fromkeys(only))
+        vids = vids[vids.video_id.isin(want)]
+        missing = [v for v in want if v not in set(vids.video_id)]
+        if missing:
+            print(f"! requested but not found: {missing}")
+        print(f"subset: {len(vids)} of {len(want)} requested videos")
     if limit:
         vids = vids.head(limit)
     rows, t0 = [], time.time()
@@ -278,9 +292,29 @@ def run_split(gt: pd.DataFrame, limit: int | None = None, cfg=None) -> pd.DataFr
     return df
 
 
-# LIMIT=3 proved the wiring; the full 34-video run is now confirmed to finish
-# in a few minutes, so this defaults to the whole test set.
+# --- the iteration set -------------------------------------------------------
+# Five hand-picked videos, ~23 min of footage, ~8 min of GPU. A full 34-video
+# run takes 21 minutes, which is too slow to think with; these five were chosen
+# to make each Tier-1 change either visibly work or visibly fail.
+#
+#   T025  D2  238s  6x traffic_accident @20s      12 windows, ALL said "normal"
+#                   -> the answer-menu bug, six independent chances to see it lift
+#   T032  D3  308s  4x loitering (2.6-37.6s)      16 windows, ALL said "normal"
+#                   -> the class we have never once scored, and D3 pays 5 marks
+#   T031  D3  360s  1x traffic_congestion 235-360 18 windows, congestion FOUND
+#                   -> the one event aggregation can win: oracle IoU 0.812, we
+#                      scored 0 by emitting 9-311s. Tests the de-hardcoding.
+#   T026  D2  238s  4x mixed classes              CONTROL - we already match one
+#                   -> regression detector, and four different classes at once
+#   T030  D2  239s  NORMAL                        CONTROL - false alarms
+#                   -> guards the 100% D2 precision that item 1 puts at risk
+#
+# Baseline over these five: 1 of 15 ground-truth events matched (T026's spill).
+# Set to None for the full set once a change looks right.
+ONLY_VIDEOS = ["T025", "T026", "T030", "T031", "T032"]
+
 LIMIT = None
-PRED = run_split(GT_TEST if not GT_TEST.empty else GT_TRAIN, limit=LIMIT)
+PRED = run_split(GT_TEST if not GT_TEST.empty else GT_TRAIN,
+                 limit=LIMIT, only=ONLY_VIDEOS)
 PRED.to_json(RUNS / "predictions_raw.json", orient="records", indent=1)
 print(f"\nwrote {RUNS / 'predictions_raw.json'}")

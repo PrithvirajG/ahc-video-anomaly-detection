@@ -78,6 +78,15 @@ class Config:
     exit_conf: float = 0.35        # ...and to close it (hysteresis)
     merge_gap_sec: float = 3.0     # bridge two events of the same class
 
+    # The only declared constant left in the extent path. Cell 7 removed the 15s
+    # floor, the 180s cap and both merge-gap constants; what remains is a
+    # symmetric quantisation allowance, because frames land on a 1/sample_fps
+    # grid and a real boundary can sit one interval outside the window that
+    # caught it. Larger helps a straddled boundary and hurts a very short event
+    # (IoU falls once the prediction outgrows the truth), so it lives here to be
+    # swept offline against stored window_verdicts rather than re-run on a GPU.
+    extent_buffer_sec: float = 2.0
+
 
 CFG = Config()
 

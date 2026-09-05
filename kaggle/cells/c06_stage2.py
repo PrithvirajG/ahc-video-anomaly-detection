@@ -130,13 +130,24 @@ CLASS_EMB = embed_texts(CLASS_EMB_TEXTS)
 CLASS_OWNER = np.array(CLASS_EMB_OWNER)
 
 
-def shortlist_classes(img_emb: torch.Tensor, k: int = 3) -> list[str]:
+def shortlist_classes(img_emb: torch.Tensor, k: int = 5) -> list[str]:
     """Rank the eleven anomaly labels for a window by max similarity.
 
     Note this is NOT used as a detector - Alert-CLIP shows CLIP-family text
     embeddings for normal vs abnormal are entangled enough that raw similarity
     is a poor yes/no. It is used only to decide which questions to ask, where
     being roughly right is sufficient and being wrong just wastes a question.
+
+    That last sentence was false for the whole first run, and it cost us most of
+    our score. See build_prompt() below: the shortlist was also injected into
+    the required JSON schema, so being wrong did not waste a question - it
+    deleted the correct answer. The shortlist is now a hint and nothing else,
+    which is what this docstring always claimed.
+
+    k is 5 rather than 3 because the shortlist no longer restricts anything, so
+    a wider hint costs only prompt length. It was measured at 34% hit rate for
+    k=3 against a 27% random baseline, i.e. very nearly uninformative; widening
+    it is a stopgap until the linear probe replaces this ranking entirely.
     """
     sim = (img_emb.mean(0, keepdim=True) @ CLASS_EMB.T).squeeze(0)
     best = {}
@@ -214,14 +225,40 @@ SYSTEM = (
 )
 
 
-def build_prompt(candidates: list[str]) -> str:
+def build_prompt(hint_classes: list[str]) -> str:
+    """Ask about the shortlisted classes; accept an answer from all eleven.
+
+    hint_classes chooses which ASK-HINT question banks to spell out. It does NOT
+    restrict what the model may answer - the schema below always offers every
+    anomaly class plus "normal".
+
+    That separation is the single highest-value fix in this project, because the
+    previous version collapsed it. `candidates` went into the required JSON
+    schema, so the model had to reply with one of three classes or "normal".
+    Measured on the practice pack, over the 47 windows that actually overlapped
+    a real ground-truth event:
+
+        correct class present in the 3-way shortlist   34%   (random 3-of-11: 27%)
+        model answered "normal"                        79%
+        right class never on the menu at all           31 of 47   (66%)
+
+    So two thirds of our misses were a multiple-choice question with the correct
+    answer removed, and "normal" was the only remaining option that was not
+    definitionally wrong. Of 26 ground-truth timed events, 23 had a window
+    overlapping them and only 3 had a window of the right class - we were
+    looking at 88% of real events and recognising 12%.
+
+    The question banks stay shortlisted (top 5, not all 11) so the prompt does
+    not quadruple in length and dilute attention across sixty-odd questions.
+    """
     lines = [
         "These frames were flagged by an automatic filter. Decide whether they show "
         "a genuine incident that a responder should be sent to.",
         "",
-        "Check each of the following specifically:",
+        "These checks are the most likely possibilities, not the only ones - if "
+        "what you see is a different kind of incident, name that instead:",
     ]
-    for cls in candidates:
+    for cls in hint_classes:
         lines.append(f"\n[{cls}]")
         lines += [f"  - {q}" for q in ASK_HINT.get(cls, [])]
     lines += [
@@ -230,10 +267,28 @@ def build_prompt(candidates: list[str]) -> str:
         "detected - look there first, but judge the whole frame.",
         "",
         "Reply with JSON only, no other text:",
-        '{"anomaly": true|false, "class": "<one of: ' + ", ".join(candidates + ["normal"]) + '>", '
+        '{"anomaly": true|false, "class": "<one of: '
+        + ", ".join(ANOMALY_CLASSES + ["normal"]) + '>", '
         '"confidence": <0.0-1.0>, "description": "<one short sentence>"}',
     ]
     return "\n".join(lines)
+
+
+def resolve_class(raw: str) -> str:
+    """Map a model's class string onto one of the twelve, tolerantly.
+
+    Exact-match-or-normal was safe while the schema offered three options the
+    model could copy verbatim. Now that it chooses freely from eleven, a reply
+    of "traffic accident" or "Traffic_Accident" would be silently scored as
+    normal - reintroducing the same failure this change exists to remove, just
+    one layer further down. Normalise separators and case before giving up.
+    """
+    s = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    s = re.sub(r"_+", "_", s).strip("_")
+    if s in CLASSES:
+        return s
+    squashed = {c.replace("_", ""): c for c in CLASSES}
+    return squashed.get(s.replace("_", ""), "normal")
 
 
 def parse_json_reply(text: str) -> dict:
@@ -243,9 +298,7 @@ def parse_json_reply(text: str) -> dict:
     if m:
         try:
             d = json.loads(m.group(0))
-            cls = str(d.get("class", "normal")).strip()
-            if cls not in CLASSES:
-                cls = "normal"
+            cls = resolve_class(d.get("class", "normal"))
             conf = float(d.get("confidence", 0.0))
             return {
                 "anomaly": bool(d.get("anomaly", False)) and cls != "normal",

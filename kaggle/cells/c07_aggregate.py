@@ -44,8 +44,14 @@ DEFAULT_MIN_DUR = 2.0
 # split T031's fourteen agreeing congestion windows into three separate events -
 # each then emitted at the 15s fallback, turning one 125s event into three
 # fragments that the arena penalises. 60s = three scan slots.
-CROSS_CLASS_GAP_SEC = 30.0   # smoke-then-crowd: one incident seen twice
-SAME_CLASS_GAP_SEC  = 90.0   # a long ongoing event with quiet slots in it
+# --- REMOVED: CROSS_CLASS_GAP_SEC / SAME_CLASS_GAP_SEC ------------------------
+# Both were time constants standing in for a question the data already answers.
+# T031 settles it: fourteen windows all calling traffic_congestion span 9s-311s
+# at a 20s scan stride, and the truth is ONE 125s event at 235-360. Merging all
+# fourteen gives IoU 0.22; splitting them all gives ~0.02 each. No value of a
+# gap constant produces the right answer, because the right question is not how
+# far apart two detections are but whether anything happened in between - and
+# the health curve records exactly that. See _recovered_between().
 
 # --- how long was it, really? ------------------------------------------------
 # Our window boundaries measure OUR SAMPLING, not the event: 4 frames at 2fps is
@@ -60,93 +66,147 @@ SAME_CLASS_GAP_SEC  = 90.0   # a long ongoing event with quiet slots in it
 # the walk returns [507.0, 533.5] against a true event of [490, 535], IoU 0.589,
 # a pass. The same detections under a fixed 10s expansion give IoU 0.444, a
 # fail. Measurement beats the constant.
-EXTENT_LOOSE_FACTOR = 0.4    # walk while health < health_thresh * this
-EXTENT_MAX_SEC = 180.0       # cap: a broadly-low-health video must not
-                             # collapse into one giant event swallowing everything
+EXTENT_LOOSE_FACTOR = 0.4    # walk while health < health_thresh * this.
+                             # Kept, because it is a FRACTION OF A CALIBRATED
+                             # NUMBER, not a guessed duration - health_thresh is
+                             # fitted on known-normal clips, and this says "still
+                             # depressed" relative to it.
 
-# FALLBACK, and it is a genuine prior rather than a measurement - flagged here
-# because it is the weakest link in this cell. When the health curve gives no
-# usable extent (an isolated dip, or a video where anomalous frames look no
-# different from normal ones - measured on T033's first event, separation of
-# only +0.006), there is nothing to measure and we emit this instead. It is a
-# floor that stops a 1.5s event being emitted, not a claim about how long the
-# incident lasted.
+# --- REMOVED: EXTENT_MAX_SEC (180s cap) --------------------------------------
+# It made any event longer than 360s unmatchable, and the evaluation pack's
+# E027 is exactly that: one event spanning ~600s of a 602s video. A cap on how
+# long reality is allowed to be is not a safeguard, it is an assertion.
+
+# --- REMOVED: FALLBACK_EVENT_SEC (15s floor) ---------------------------------
+# The honest reason it existed: when the health curve gave no usable extent, we
+# had nothing to say and said "15 seconds" anyway. That is not a measurement,
+# and it made 8 of 26 ground-truth events (31%) unmatchable by construction -
+# IoU >= 0.5 needs a prediction no more than twice the true length, so a 15s
+# floor can never match a 5s event, of which the practice set has nine.
 #
-# 15s, not the 10s this started at. 10s came from sweeping the timed test events
-# assuming a prediction PERFECTLY CENTRED on the real event - an assumption that
-# does not survive contact with the data, because a detection lands wherever the
-# VLM happened to be looking, usually off-centre and often near one end. Re-swept
-# against the ACTUAL detection positions from a full run: 10s scores zero matches,
-# anything >=12s converts T026's road_spill (a 10s prediction sitting inside a
-# ~20.8s real event, IoU 0.481 - failing the 0.5 gate by 0.019) into a pass.
-# 15s takes that with margin and sits nearer the real 20s median duration.
-# Caveat worth keeping in view: this is tuned on ONE convertible case, so treat
-# it as a better-reasoned prior, not a validated optimum.
-FALLBACK_EVENT_SEC = 15.0
+# Replaced by the only assumption we actually need: a symmetric buffer, below.
 
 
-def measure_extent(centre_t: float, health_curve, thresh: float,
-                   duration_sec: float | None = None) -> tuple[float, float, str]:
-    """Walk outward from centre_t while health stays depressed.
+def extent_buffer(cfg=None) -> float:
+    """Half-width of the uncertainty around a detected boundary, in seconds.
 
-    health_curve: [(t, health), ...] ascending by t, or None.
-    Returns (start, end, source) where source is "measured" or "fallback" so
-    the caller - and anyone reading the output - can tell which is which.
+    This is the ONE declared constant left in the extent path, and it is a
+    quantisation allowance rather than a guess about duration: frames arrive on
+    a 1/sample_fps grid, so a true boundary can sit up to one sampling interval
+    outside the window that caught it, and the window itself is built from
+    whichever frames the sampler happened to land on.
+
+    Default 2.0s. Note the tension - a larger buffer helps a boundary we
+    straddled and hurts a very short event, because IoU falls as the prediction
+    outgrows the truth. On a 2.6s event (T032 has one) a 2s buffer already
+    costs the match. It lives in CFG so it can be swept offline against stored
+    window_verdicts without another GPU run.
     """
-    def _fallback():
-        s = centre_t - FALLBACK_EVENT_SEC / 2
-        e = centre_t + FALLBACK_EVENT_SEC / 2
-        return s, e, "fallback"
+    cfg = cfg or CFG
+    return float(getattr(cfg, "extent_buffer_sec", 2.0))
 
+
+def _recovered_between(health_curve, t_a: float, t_b: float, loose: float) -> bool:
+    """Did the scene demonstrably return to normal between two detections?
+
+    This replaces both gap constants. A majority vote over the samples strictly
+    between the two windows: if most of them climbed back above `loose`, the
+    scene recovered and these are two incidents; if they stayed depressed, it
+    never stopped and this is one. Majority rather than "any", so a single noisy
+    frame cannot split a real event.
+
+    With no curve to consult we return False - absence of evidence for recovery
+    is not evidence of it, and merging is the conservative choice given the
+    arena penalises fragments twice (the miss, plus each extra as a false alarm).
+    """
     if not health_curve:
-        s, e, src = _fallback()
-    else:
+        return False
+    mids = [h for t, h in health_curve if t_a < t < t_b]
+    if not mids:
+        return False
+    return sum(h >= loose for h in mids) > len(mids) / 2
+
+
+def measure_extent(cluster: list[dict], health_curve, thresh: float,
+                   duration_sec: float | None = None,
+                   cfg=None) -> tuple[float, float, str]:
+    """How long was it? Answer from the windows and the curve, nothing else.
+
+    Two measurements, composed:
+      1. the span of the windows that actually saw it - direct evidence, and
+         previously thrown away in favour of a prior
+      2. extended outward while the health curve stays depressed - the scene
+         itself telling us where it returned to normal
+
+    ...plus a symmetric quantisation buffer. No floor, no cap, no prior. A
+    one-window event is as short as that window; a forty-window event is as long
+    as they span; and if the curve says the depression continues past the last
+    window, so does the event.
+
+    Returns (start, end, source) with source "measured" when the curve was
+    consulted and "windows" when there was no curve to consult.
+    """
+    buf = extent_buffer(cfg)
+    s = min(w["t0"] for w in cluster)
+    e = max(w["t1"] for w in cluster)
+    src = "windows"
+
+    if health_curve:
         ts = [t for t, _ in health_curve]
         hs = [h for _, h in health_curve]
-        i = min(range(len(ts)), key=lambda j: abs(ts[j] - centre_t))
         loose = thresh * EXTENT_LOOSE_FACTOR
-        a = b = i
+        a = next((j for j, t in enumerate(ts) if t >= s), len(ts) - 1)
         while a > 0 and hs[a - 1] < loose:
             a -= 1
+        b = next((j for j in range(len(ts) - 1, -1, -1) if ts[j] <= e), 0)
         while b < len(hs) - 1 and hs[b + 1] < loose:
             b += 1
-        s, e, src = ts[a], ts[b], "measured"
-        if (e - s) < FALLBACK_EVENT_SEC:      # isolated dip - nothing to measure
-            s, e, src = _fallback()
-        elif (e - s) > EXTENT_MAX_SEC:        # runaway - cap around the centre
-            s = centre_t - EXTENT_MAX_SEC / 2
-            e = centre_t + EXTENT_MAX_SEC / 2
-            src = "measured-capped"
+        s, e = min(s, ts[a]), max(e, ts[b])
+        src = "measured"
 
+    s, e = s - buf, e + buf
     if s < 0:
-        e, s = e - s, 0.0
+        s = 0.0
     if duration_sec is not None and e > duration_sec:
-        e = duration_sec
-        s = max(0.0, min(s, e - 1.0))
+        e = float(duration_sec)
+        s = min(s, max(0.0, e - 1e-3))
     return s, e, src
 
 
-def cluster_windows(windows: list[dict], cross_gap: float = CROSS_CLASS_GAP_SEC,
-                    same_gap: float = SAME_CLASS_GAP_SEC) -> list[list[dict]]:
-    """Group detections into incidents, with the tolerance depending on whether
-    consecutive detections agree on the class.
+def cluster_windows(windows: list[dict], health_curve=None,
+                    thresh: float | None = None) -> list[list[dict]]:
+    """Group detections into incidents by asking whether the scene recovered.
 
-    One gap cannot serve both cases, measured on real runs:
-      - SAME class, far apart: T031 has fourteen windows spanning 9s-311s all
-        calling traffic_congestion. Those are one ongoing event and must merge,
-        even across 40s gaps where a scan slot came back normal.
-      - DIFFERENT classes, far apart: T033's accident at 507s and an unrelated
-        detection at 385s are separate incidents. Merging them destroyed a
-        working IoU 0.59 match (it became 0.29), so cross-class merging has to
-        stay tight - it exists for smoke-then-crowd at 16s apart, not for
-        things minutes apart.
+    One rule now serves both the same-class and cross-class cases, because it
+    was never really a question about class or about elapsed time:
+
+      - T031: fourteen windows spanning 9s-311s all calling traffic_congestion,
+        truth is one 125s event at 235-360. A gap constant merges all of them
+        (IoU 0.22) or splits all of them (~0.02 each). The curve splits them
+        where the road actually cleared.
+      - T033: an accident at 507s and smoke at 523s are one incident seen twice
+        and must merge across a class change; the same video's 385s detection is
+        a different incident and must not. Elapsed time cannot tell those apart.
+        Whether health recovered in between can.
+
+    Falls back to strict adjacency when there is no curve, which is the honest
+    behaviour: with no evidence about the interval we only merge detections that
+    actually touch.
     """
     ws = sorted((w for w in windows if w["class"] != "normal"), key=lambda w: w["t0"])
+    if thresh is None:
+        thresh = CFG.health_thresh if CFG.health_thresh is not None else -0.4
+    loose = thresh * EXTENT_LOOSE_FACTOR
+
     clusters, cur = [], []
     for w in ws:
         if cur:
-            gap = same_gap if w["class"] == cur[-1]["class"] else cross_gap
-            if (w["t0"] - cur[-1]["t1"]) > gap:
+            prev = cur[-1]
+            if health_curve:
+                split = _recovered_between(health_curve, prev["t1"], w["t0"], loose)
+            else:
+                split = w["t0"] > prev["t1"] + 1e-6      # no curve: touch or split
+            if split:
                 clusters.append(cur)
                 cur = []
         cur.append(w)
@@ -172,7 +232,7 @@ def aggregate_events(windows: list[dict], cfg=None, health_curve=None,
     thresh = cfg.health_thresh if cfg.health_thresh is not None else -0.4
     out = []
 
-    for cluster in cluster_windows(windows):
+    for cluster in cluster_windows(windows, health_curve, thresh):
         strong = [w for w in cluster if w["confidence"] >= cfg.enter_conf]
         if not strong:
             continue                       # hysteresis: nothing opened this cluster
@@ -195,19 +255,19 @@ def aggregate_events(windows: list[dict], cfg=None, health_curve=None,
                 reason = verdict.get("reason", "adjudicated")
 
         # The span of the agreeing windows is itself a measurement of duration and
-        # must never be thrown away: fourteen windows spanning 9s-311s all calling
-        # congestion is direct evidence of a long event, and collapsing that to a
-        # 15s prior (as happened on T031) discards the strongest signal we have.
-        win_start = min(w["t0"] for w in strong)
-        win_end = max(w["t1"] for w in strong)
-        centre = (win_start + win_end) / 2
-        start, end, src = measure_extent(centre, health_curve, thresh, duration_sec)
-        if (win_end - win_start) > (end - start):
-            start, end = win_start, win_end
-            src = "window-span"
-            if duration_sec is not None:
-                end = min(end, duration_sec)
+        # is now where measure_extent STARTS, rather than something it has to
+        # override afterwards. The old window-span override existed only because
+        # the fallback prior kept discarding this evidence; with the prior gone
+        # there is nothing to override.
+        start, end, src = measure_extent(strong, health_curve, thresh,
+                                         duration_sec, cfg)
 
+        # TEMPORAL survives the de-hardcoding on purpose, and the distinction is
+        # worth being explicit about: it never invents a duration, it only
+        # SUPPRESSES a claim that is physically implausible for its class (a
+        # 0.3s fire). Every value is <= 4s and below the shortest real event we
+        # have, so it should never fire in practice - if it starts firing, that
+        # is a signal worth reading, not a threshold worth raising.
         if (end - start) + 1e-6 < TEMPORAL.get(main, DEFAULT_MIN_DUR):
             continue                       # too brief to be this class
 
@@ -224,7 +284,7 @@ def aggregate_events(windows: list[dict], cfg=None, health_curve=None,
             "confidence": round(float(np.mean([w["confidence"] for w in strong])), 3),
             "peak_confidence": round(float(main_conf), 3),
             "n_windows": len(cluster),
-            "extent_source": src,           # "measured" | "measured-capped" | "fallback"
+            "extent_source": src,           # "measured" (curve consulted) | "windows"
             "primary_reason": reason,
             "sub_tags": sub_tags,           # kept for analysis, not for the arena JSON
             "description_summary": best.get("description", ""),
@@ -240,30 +300,59 @@ def _selftest():
     assert not aggregate_events([mk("fire", t, 0.4) for t in range(5)]), \
         "sub-enter_conf windows must not open an event"
 
-    # a lone brief detection must still reach the floor, not be emitted at 1.5s
+    buf = extent_buffer()
+
+    # NO FLOOR. A lone 1s detection is a ~1s event plus the buffer either side -
+    # not the 15s the old prior asserted. This is the change that makes the
+    # nine sub-10s ground-truth events reachable at all.
     ev = aggregate_events([mk("traffic_accident", 5.0, 0.9)])[0]
-    assert ev["end_time_sec"] - ev["start_time_sec"] >= FALLBACK_EVENT_SEC - 1e-6
-    assert ev["extent_source"] == "fallback", "no curve given -> must say fallback"
+    span = ev["end_time_sec"] - ev["start_time_sec"]
+    assert abs(span - (1.0 + 2 * buf)) < 1e-6, f"expected measured span, got {span}"
+    assert ev["extent_source"] == "windows", "no curve given -> say so"
 
-    # detections 16s apart are ONE incident, not two fragments
-    assert len(aggregate_events([mk("traffic_accident", 500.0, 0.9),
-                                 mk("traffic_accident", 516.0, 0.9)])) == 1
+    # NO CAP. A genuinely long event stays long: E027's truth is one event over
+    # ~600s of a 602s video, which the old 180s cap made unmatchable.
+    long_curve = [(t, -0.5) for t in range(0, 600, 2)]
+    ev = aggregate_events([mk("traffic_congestion", t, 0.9) for t in range(10, 580, 20)],
+                          health_curve=long_curve, duration_sec=602.0)[0]
+    assert ev["end_time_sec"] - ev["start_time_sec"] > 500, \
+        f"a 600s event must survive aggregation, got {ev}"
 
-    # cross-class: T033's real shape. Without an adjudicator the main tag is the
-    # most confident observation and the other becomes a sub-tag - one incident.
+    # SPLIT ON RECOVERY: the T031 shape. Windows agree on the class throughout,
+    # but the scene demonstrably clears in the middle, so this is two incidents
+    # and not one 300s blob. No gap constant can express this.
+    recov = [(t, 0.2 if 120 <= t <= 220 else -0.5) for t in range(0, 320, 2)]
+    evs = aggregate_events([mk("traffic_congestion", t, 0.9)
+                            for t in (20, 60, 100, 240, 280, 300)],
+                           health_curve=recov, duration_sec=320.0)
+    assert len(evs) == 2, f"recovery in the middle must split, got {len(evs)}"
+
+    # ...and with health depressed throughout, the same detections are ONE event
+    flat = [(t, -0.5) for t in range(0, 320, 2)]
+    evs = aggregate_events([mk("traffic_congestion", t, 0.9)
+                            for t in (20, 60, 100, 240, 280, 300)],
+                           health_curve=flat, duration_sec=320.0)
+    assert len(evs) == 1, f"no recovery -> one ongoing event, got {len(evs)}"
+
+    # CROSS-CLASS, T033's real shape: smoke then an altercation 16s later with
+    # health depressed across the interval is one incident seen twice. The class
+    # change is not what decides it - the curve is.
+    t033_curve = [(t, -0.5 if 500 <= t <= 530 else 0.2) for t in range(400, 600)]
     t033 = [mk("smoke", 507.5, 0.95), mk("fighting_or_violence", 523.5, 0.90)]
-    evs = aggregate_events(t033)
+    evs = aggregate_events(t033, health_curve=t033_curve, duration_sec=628.8)
     assert len(evs) == 1, "one incident, not two"
     assert evs[0]["class_name"] == "smoke"
     assert [s["class_name"] for s in evs[0]["sub_tags"]] == ["fighting_or_violence"]
 
     # ...and with an adjudicator the model's call wins, sub-tags still kept
-    evs = aggregate_events(t033, adjudicator=lambda c: {
-        "primary": "traffic_accident", "confidence": 0.8, "reason": "aftermath"})
+    evs = aggregate_events(t033, health_curve=t033_curve, duration_sec=628.8,
+                           adjudicator=lambda c: {"primary": "traffic_accident",
+                                                  "confidence": 0.8,
+                                                  "reason": "aftermath"})
     assert evs[0]["class_name"] == "traffic_accident"
     assert {s["class_name"] for s in evs[0]["sub_tags"]} == {"smoke", "fighting_or_violence"}
 
-    # measured extent beats the prior when the curve has signal
+    # the curve extends an event beyond the window that caught it
     curve = [(t, -0.5 if 490 <= t <= 535 else 0.2) for t in range(400, 600)]
     ev = aggregate_events([mk("traffic_accident", 510.0, 0.9)],
                           health_curve=curve, duration_sec=628.8)[0]
@@ -271,11 +360,18 @@ def _selftest():
     assert ev["start_time_sec"] <= 495 and ev["end_time_sec"] >= 530, \
         f"measured extent should track the low-health region, got {ev}"
 
+    # a short event stays short - the whole point of removing the floor
+    short_curve = [(t / 2, -0.5 if 30 <= t / 2 <= 35 else 0.2) for t in range(0, 200)]
+    ev = aggregate_events([mk("traffic_accident", 32.0, 0.9)],
+                          health_curve=short_curve, duration_sec=237.0)[0]
+    assert ev["end_time_sec"] - ev["start_time_sec"] < 12.0, \
+        f"a 5s event must not be inflated past IoU range, got {ev}"
+
     # expansion must never leave the video
     late = aggregate_events([mk("traffic_accident", 99.0, 0.9)], duration_sec=100.0)[0]
     assert late["end_time_sec"] <= 100.0 and late["start_time_sec"] >= 0.0
 
-    print("temporal aggregation self-test passed (8 cases)")
+    print("temporal aggregation self-test passed (10 cases)")
 
 
 _selftest()
