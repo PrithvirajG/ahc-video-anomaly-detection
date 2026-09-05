@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 import json
 from pathlib import Path
 
@@ -232,8 +233,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true",
                     help="syntax-check the cell sources and exit")
-    ap.add_argument("--clip", type=int, metavar="N", default=None,
-                    help="copy cell N (1-8) to the clipboard for pasting into Kaggle")
+    ap.add_argument("--clip", metavar="CELL", default=None,
+                    help="copy a cell to the clipboard by its NOTEBOOK label "
+                         "(1, 2, ... 5b, 6 ...), not its position in the list")
     args = ap.parse_args()
 
     sources = {}
@@ -262,14 +264,20 @@ def main() -> int:
         return 0
 
     if args.clip is not None:
-        if not 1 <= args.clip <= len(PLAN):
-            print(f"--clip must be 1..{len(PLAN)}")
+        # Match on the LABEL in the filename (c05b -> "5b"), not on position in
+        # PLAN. Inserting c05b made those two disagree - "cell 5b" sits at index
+        # 6 - and silently pasting cell 6 where 5b was meant is a mistake you
+        # only notice several cells later.
+        labels = {re.sub(r"^c0*", "", n.split("_")[0]): n for n, _ in PLAN}
+        want = str(args.clip).strip().lower()
+        name = labels.get(want)
+        if name is None:
+            print(f"--clip must be one of: {', '.join(labels)}")
             return 1
-        name = PLAN[args.clip - 1][0]
         import subprocess
         subprocess.run("clip", input=sources[name].encode("utf-8"),
                        check=False, shell=True)
-        print(f"cell {args.clip} ({name}) copied to clipboard - "
+        print(f"cell {want} ({name}) copied to clipboard - "
               "paste into the Kaggle editor")
         return 0
 
