@@ -176,8 +176,16 @@ def stage1_video(path, cfg=None):
     imgs = [to_pil(draw_visual_prompt(k["frame"], k["box"], cfg.visual_prompt)) for k in kept]
     emb = embed_images(imgs)
     h = health(emb)
-    for k, hv in zip(kept, h.tolist()):
+    # Keep the embedding, not just the scalar derived from it. The probe in cell
+    # 5b needs 8 frames mean-pooled over 16s, and these are exactly those frames
+    # already encoded - so retaining them makes probe scoring cost ZERO extra
+    # GPU rather than a second pass. About 2.7 MB for the longest test video
+    # (870 kept frames x 768 floats), which is nothing against the frames
+    # themselves already held in `kept`.
+    _e = emb.detach().float().cpu().numpy()
+    for k, hv, ev in zip(kept, h.tolist(), _e):
         k["health"] = hv
+        k["emb"] = ev
     return kept, n_seen
 
 

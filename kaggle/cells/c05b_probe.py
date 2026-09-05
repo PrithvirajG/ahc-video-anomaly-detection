@@ -170,7 +170,7 @@ def build_probe_embeddings(force: bool = False):
 PROBE_X, PROBE_Y, PROBE_IDS = build_probe_embeddings()
 
 
-def fit_probe(X, y, C: float = 1.0):
+def fit_probe(X, y, C: float | None = None):
     """Multinomial logistic regression over frozen embeddings.
 
     Balanced class weights because the cap does not fully level things (fire has
@@ -180,6 +180,7 @@ def fit_probe(X, y, C: float = 1.0):
     Reported on a held-out split, not on the training data, because a probe that
     memorises 3,000 embeddings would look excellent and predict nothing.
     """
+    C = float(getattr(CFG, "probe_C", 100.0)) if C is None else C
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import classification_report, confusion_matrix
@@ -253,10 +254,64 @@ def probe_anomaly(emb) -> float:
 
 
 def probe_shortlist(emb, k: int = 5) -> list[str]:
-    """The k most likely ANOMALY classes, learned rather than written."""
+    """The k most likely ANOMALY classes, learned rather than written.
+
+    Held out, the correct class is in the top 5 for 98.3% of anomalous clips
+    (top-3: 88.4%). The written shortlist this replaces managed 34% at k=3
+    against a 27% baseline for drawing three of eleven at random.
+    """
     p = probe_predict(emb)
     if not p:
         return []
     ranked = sorted(((c, v) for c, v in p.items() if c != "normal"),
                     key=lambda kv: -kv[1])
     return [c for c, _ in ranked[:k]]
+
+
+def probe_window(kept: list[dict], centre_t: float, cfg=None) -> dict:
+    """Score the probe on PROBE_SPAN_SEC of video centred on centre_t.
+
+    Costs no GPU. Stage 1 already encoded every kept frame and cell 5 now keeps
+    those vectors on the records, so this is a mean over arrays that exist -
+    which is also exactly the shape the probe was trained on (8 frames spanning
+    16s, mean-pooled), rather than the ~2s window stage 2 uses.
+
+    Returns {} when the probe is unavailable or nothing was sampled nearby, so
+    every caller can treat an empty dict as "no opinion".
+    """
+    cfg = cfg or CFG
+    if PROBE is None or not kept:
+        return {}
+    half = PROBE_SPAN_SEC / 2
+    near = [k for k in kept
+            if centre_t - half <= k["t"] <= centre_t + half and "emb" in k]
+    if not near:
+        return {}
+    # take PROBE_FRAMES evenly across the span, matching how a training example
+    # was built - not the first 8, which would bias to the start of the window
+    if len(near) > PROBE_FRAMES:
+        idx = np.linspace(0, len(near) - 1, PROBE_FRAMES).round().astype(int)
+        near = [near[i] for i in sorted(set(idx.tolist()))]
+    v = np.mean([k["emb"] for k in near], axis=0)
+    return probe_predict(v)
+
+
+def probe_curve(kept: list[dict], step_sec: float = 4.0, cfg=None) -> list[tuple]:
+    """[(t, P(anomalous)), ...] across a whole video.
+
+    The replacement for the health curve wherever a per-video signal is needed.
+    Sampled every step_sec rather than per frame because the probe's unit is a
+    16s span - scoring it at 2fps would return sixteen near-identical values.
+    """
+    cfg = cfg or CFG
+    if PROBE is None or not kept:
+        return []
+    t0, t1 = kept[0]["t"], kept[-1]["t"]
+    out = []
+    t = t0
+    while t <= t1:
+        p = probe_window(kept, t, cfg)
+        if p:
+            out.append((round(float(t), 2), round(1.0 - p.get("normal", 1.0), 4)))
+        t += step_sec
+    return out

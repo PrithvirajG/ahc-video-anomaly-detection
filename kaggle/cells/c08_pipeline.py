@@ -136,6 +136,13 @@ def process_video(path, cfg=None, verbose=False) -> dict:
         pil = [to_pil(draw_visual_prompt(r["frame"], r["box"], cfg.visual_prompt))
                for r in picked]
         emb = embed_images(pil)
+        # The probe sees 16s around this moment, not the ~2s the VLM sees, and
+        # it costs nothing: stage 1 already encoded these frames and cell 5 now
+        # keeps the vectors. Scored BEFORE the VLM so its shortlist can steer
+        # the question, and kept afterwards so it can contradict the answer.
+        centre_t = (w[0]["t"] + w[-1]["t"]) / 2
+        pw = probe_window(kept, centre_t, cfg) if "probe_window" in globals() else {}
+        p_anom = float(1.0 - pw.get("normal", 1.0)) if pw else 0.0
         cands = shortlist_classes(emb)
         try:
             verdict = vlm_verify(pil, cands)
@@ -143,6 +150,34 @@ def process_video(path, cfg=None, verbose=False) -> dict:
             print(f"  ! vlm failed on window @{w[0]['t']:.1f}s: "
                   f"{str(e).splitlines()[0][:120]}")
             continue
+
+        # --- the probe may overrule a "normal" verdict, and only that ---------
+        # Stage 2 answered "normal" on 79% of the windows that overlapped a real
+        # event, including all 28 windows on T025's six accidents and T032's
+        # four loitering events - with every class on offer. The probe reaches
+        # 100% held-out recall on loitering and 85% on congestion, so where it
+        # is confident and stage 2 has abstained, silence is the worse answer.
+        #
+        # One direction only. The probe never overrides a POSITIVE call, because
+        # stage 2 looked at pixels and the probe looked at a mean of embeddings,
+        # and it never fires below probe_override_p - measured at 0.95 that is
+        # 353 of 484 held-out anomalies caught with zero false positives on 75
+        # held-out normal clips. Held-out training clips are not 240-second test
+        # videos from other cameras, so this is deliberately stricter than the
+        # escalation bar and switchable from CFG.
+        overrode = False
+        if (getattr(cfg, "probe_override_enabled", False) and pw
+                and verdict["class"] == "normal"
+                and p_anom >= getattr(cfg, "probe_override_p", 0.95)):
+            top = max(((c, v) for c, v in pw.items() if c != "normal"),
+                      key=lambda kv: kv[1], default=None)
+            if top:
+                verdict = {**verdict, "class": top[0], "anomaly": True,
+                           "confidence": round(float(p_anom), 3),
+                           "description": verdict.get("description", "")
+                           or f"probe: {top[0].replace('_', ' ')}"}
+                overrode = True
+
         results.append({
             "t0": w[0]["t"],
             "t1": w[-1]["t"] + 1.0 / cfg.sample_fps,
@@ -153,6 +188,12 @@ def process_video(path, cfg=None, verbose=False) -> dict:
             "source": source,          # "escalated" | "scan" - the experiment's
                                        # whole point: traceable back to mechanism
             "health": float(np.mean([r["health"] for r in picked])),
+            # both signals stored side by side, so the next question - which of
+            # these two was right, and where - is answerable offline
+            "probe_anomaly": round(p_anom, 4),
+            "probe_top": (max(((c, v) for c, v in pw.items() if c != "normal"),
+                              key=lambda kv: kv[1])[0] if pw else None),
+            "probe_override": overrode,
         })
     t_vlm = time.time() - t_vlm0
     n_scan = sum(1 for _, s in to_look_at if s == "scan")

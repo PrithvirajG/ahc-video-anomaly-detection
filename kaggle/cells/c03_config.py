@@ -87,6 +87,33 @@ class Config:
     # swept offline against stored window_verdicts rather than re-run on a GPU.
     extent_buffer_sec: float = 2.0
 
+    # --- the learned prior (cell 5b) --------------------------------------
+    # All three chosen by sweeping the cached training embeddings offline, which
+    # costs seconds and no GPU. Held out 559 clips, 25% of the capped set:
+    #
+    #   C          top-1   top-5   recall@0.90   specificity@0.90
+    #   1          0.673   0.969      0.849           0.893
+    #   10         0.717   0.977      0.903           0.933
+    #   100        0.739   0.983      0.930           0.947   <- chosen
+    #   300        0.741   0.981      0.938           0.933
+    #
+    # Less regularisation is better here, which is what 768 well-conditioned
+    # frozen features and 1,676 training rows should predict.
+    probe_C: float = 100.0
+
+    # Escalate a window when the probe puts P(anomalous) at or above this.
+    # 0.90 buys recall 0.930 at specificity 0.947 - it replaces a health
+    # threshold measured to be INVERTED on three of four test videos.
+    probe_escalate_p: float = 0.90
+
+    # ...and the much stricter bar for the probe to CONTRADICT stage 2. At 0.95
+    # the probe caught 353 of 484 held-out anomalies with ZERO false positives
+    # on 75 held-out normal clips. Zero on held-out TRAINING clips is not zero
+    # on 240-second test videos from other cameras, so this stays conservative
+    # and separate from the escalation bar on purpose.
+    probe_override_p: float = 0.95
+    probe_override_enabled: bool = True
+
 
 CFG = Config()
 
