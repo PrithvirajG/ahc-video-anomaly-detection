@@ -63,14 +63,38 @@ def load_manifest_durations() -> dict[str, float]:
 
 
 def events_for_submission(pred_row: dict, level: int) -> list[dict]:
-    """Our internal event dict -> the arena's exact per-event schema."""
+    """Our internal event dict -> the arena's exact per-event schema.
+
+    Level 1 gets ONE event, never more - "One label for the whole clip" is the
+    spec, not a suggestion. A second guess on a single-label task has zero
+    possible upside (Level 1 scoring gives no credit for extra classes) and
+    real downside (the arena counts each non-matching predicted event as its
+    own false alarm, on top of the miss it doesn't fix) - measured directly: a
+    tied-confidence fire+smoke double-guess on one real practice-pack video
+    was two of the six false alarms in our first submission, when emitting
+    only the correct one of the two would have cost nothing. Collapsing to the
+    single highest-confidence event can only reduce that count, never raise it.
+    """
+    events = pred_row.get("events") or []
+    if level == 1 and len(events) > 1:
+        events = [max(events, key=lambda e: e["peak_confidence"])]
     out = []
-    for e in (pred_row.get("events") or []):
+    for e in events:
+        # sub_tags stay OUT of the arena event object - the schema wants one
+        # class per event - but they are real observations, so they go into the
+        # explanation, which is a scored bonus field that never costs anything.
+        expl = e.get("description_summary") or ""
+        subs = [s["class_name"] for s in (e.get("sub_tags") or [])]
+        if subs:
+            also = ", ".join(s.replace("_", " ") for s in subs)
+            expl = (expl + f" Also observed at this incident: {also}.").strip()
+        expl = expl[:500] if len(expl) >= 20 else (expl or None)
+
         out.append({
             "class_name": e["class_name"],          # never "normal" - empty list instead
             "start_time_sec": None if level == 1 else float(e["start_time_sec"]),
             "end_time_sec": None if level == 1 else float(e["end_time_sec"]),
-            "explanation": (e.get("description_summary") or None),
+            "explanation": expl,
         })
     return out
 

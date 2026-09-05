@@ -40,6 +40,26 @@ class Config:
     escalate_pct: float = 12.0     # % lowest-health frames sent to stage 2
     health_thresh: float | None = None   # set by calibration in cell 5
 
+    # --- scan floor: guarantee long videos are actually looked at ---------
+    # health_thresh is calibrated on 5-30s training clips and then applied to
+    # 240-629s test videos from different cameras - an absolute cut taken from
+    # one distribution and used on another. Measured result: six of the eight
+    # anomalous long videos sent 0-1 windows to the VLM, and those videos carry
+    # 75 of the 100 available marks. T027 has four real traffic jams and not one
+    # of its 420 surviving frames scored below the threshold, so the VLM never
+    # looked at it at all.
+    #
+    # The floor only ever ADDS windows; escalation is untouched. Turn it off and
+    # behaviour is exactly as before.
+    scan_floor_enabled: bool = True
+    scan_floor_min_video_sec: float = 60.0   # L1 clips are 5-27s, L2/L3 are 240s+,
+                                             # so nothing sits near this boundary
+    scan_floor_interval_sec: float = 20.0    # median real event is 20s, so a 20s
+                                             # stride lands inside any median-or-
+                                             # longer event; shorter ones can still
+                                             # slip through - tighten this to close
+                                             # that gap at proportional GPU cost
+
     # --- stage 2: small VLM ----------------------------------------------
     # Qwen3-VL-4B, not the 3B this was originally pinned to for the GTX 1650's
     # 4GB VRAM. Irrelevant on a T4 (16GB) - see the long comment in cell 6's

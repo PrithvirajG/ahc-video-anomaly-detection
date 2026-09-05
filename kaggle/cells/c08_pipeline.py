@@ -23,6 +23,46 @@ def group_escalations(kept: list[dict], thresh: float, cfg=None) -> list[list[di
     return windows
 
 
+def add_scan_floor(windows: list[list[dict]], kept: list[dict],
+                   duration: float, cfg=None) -> list[tuple[list[dict], str]]:
+    """Guarantee a long video is looked at every scan_floor_interval_sec.
+
+    Returns [(frames, source), ...] where source is "escalated" or "scan", so a
+    detection can be traced back to which mechanism found it - that tag is the
+    whole point of the experiment: it lets us say what the floor actually cost
+    and gained, rather than watching the score move and guessing why.
+
+    The floor only ADDS windows. Escalation is untouched, so disabling this
+    returns behaviour to exactly what it was.
+    """
+    cfg = cfg or CFG
+    out = [(w, "escalated") for w in windows]
+    if not (cfg.scan_floor_enabled and duration > cfg.scan_floor_min_video_sec):
+        return out
+    if not kept:
+        return out
+
+    covered = [(w[0]["t"], w[-1]["t"]) for w in windows]
+    step = cfg.scan_floor_interval_sec
+    times = np.array([k["t"] for k in kept])
+
+    t = 0.0
+    while t < duration:
+        slot_end = t + step
+        # skip a slot an escalated window already covers - no point paying twice
+        if any(a < slot_end and b >= t for a, b in covered):
+            t = slot_end
+            continue
+        centre = t + step / 2
+        # the frames nearest this slot's centre, in time order
+        idx = np.argsort(np.abs(times - centre))[:cfg.vlm_frames]
+        picked = [kept[i] for i in sorted(idx.tolist())]
+        if picked and abs(picked[0]["t"] - centre) <= step:   # slot has real frames
+            out.append((picked, "scan"))
+        t = slot_end
+    return out
+
+
 def pick_frames(window: list[dict], n: int) -> list[dict]:
     """Evenly spaced across the window, so the VLM sees change rather than n
     near-duplicates from the same instant."""
@@ -69,10 +109,12 @@ def process_video(path, cfg=None, verbose=False) -> dict:
         thresh = float(np.percentile([k["health"] for k in kept], cfg.escalate_pct))
 
     windows = group_escalations(kept, thresh, cfg) if kept else []
+    duration_full = video_duration(path)
+    to_look_at = add_scan_floor(windows, kept, duration_full, cfg)
 
     results = []
     t_vlm0 = time.time()
-    for w in windows:
+    for w, source in to_look_at:
         picked = pick_frames(w, cfg.vlm_frames)
         pil = [to_pil(draw_visual_prompt(r["frame"], r["box"], cfg.visual_prompt))
                for r in picked]
@@ -91,11 +133,37 @@ def process_video(path, cfg=None, verbose=False) -> dict:
             "confidence": verdict["confidence"],
             "description": verdict["description"],
             "candidates": cands,
+            "source": source,          # "escalated" | "scan" - the experiment's
+                                       # whole point: traceable back to mechanism
+            "health": float(np.mean([r["health"] for r in picked])),
         })
     t_vlm = time.time() - t_vlm0
+    n_scan = sum(1 for _, s in to_look_at if s == "scan")
 
-    events = aggregate_events(results, cfg)
     duration = kept[-1]["t"] + 1.0 / cfg.sample_fps if kept else video_duration(path)
+
+    # The health curve is what lets aggregation MEASURE an event's extent rather
+    # than assume it - it is computed per frame in stage 1 and was previously
+    # thrown away after the escalate/skip decision.
+    curve = [(k["t"], k["health"]) for k in kept] if kept else None
+
+    def _adjudicate(cluster):
+        """One extra VLM call to name the primary incident when a cluster holds
+        several classes. Deliberately not a causal lookup table: smoke is a
+        symptom over a wrecked car and the incident itself over a thermal plant,
+        so the call belongs to the model that can see which one this is."""
+        frames = []
+        for w in cluster:
+            near = [k for k in kept if w["t0"] <= k["t"] <= w["t1"]]
+            if near:
+                r = near[len(near) // 2]
+                frames.append(to_pil(draw_visual_prompt(r["frame"], r["box"],
+                                                        cfg.visual_prompt)))
+        return adjudicate_primary(frames[:cfg.vlm_frames], cluster) if frames else None
+
+    events = aggregate_events(results, cfg, health_curve=curve,
+                              duration_sec=video_duration(path),
+                              adjudicator=_adjudicate)
     wall = time.time() - t_start
 
     # Arena schema's per-video runtime block - required on every video, and the
@@ -116,6 +184,10 @@ def process_video(path, cfg=None, verbose=False) -> dict:
         "frames_sampled": n_seen,
         "frames_kept": len(kept),
         "windows_escalated": len(windows),
+        "windows_scan_floor": n_scan,
+        # raw per-window verdicts, kept so aggregation can be re-tuned offline in
+        # seconds instead of an 8-minute GPU re-run per experiment
+        "window_verdicts": results,
         "escalation_rate": round(len(windows) and sum(len(w) for w in windows)
                                  / max(len(kept), 1) or 0.0, 4),
         "events": events,
@@ -135,7 +207,7 @@ def process_video(path, cfg=None, verbose=False) -> dict:
     }
     if verbose:
         print(f"{out['video_id']:16s} {duration:6.1f}s  kept {len(kept):4d}/{n_seen:4d}  "
-              f"win {len(windows):3d}  -> {out['class_name']:32s} "
+              f"esc {len(windows):3d} scan {n_scan:3d}  -> {out['class_name']:32s} "
               f"{out['realtime_factor']:5.2f}x realtime")
     return out
 
@@ -162,6 +234,25 @@ def run_split(gt: pd.DataFrame, limit: int | None = None, cfg=None) -> pd.DataFr
     print(f"\n{len(df)} videos, {total_video / 60:.1f} min of footage "
           f"in {(time.time() - t0) / 60:.1f} min wall "
           f"({total_video / max(time.time() - t0, 1e-6):.2f}x realtime)")
+    # --- what did the scan floor actually buy? -------------------------------
+    # The number this experiment turns on. Without it we would see the score move
+    # and be guessing which mechanism moved it.
+    if "window_verdicts" in df:
+        esc = scan = esc_hit = scan_hit = 0
+        for _, r in df.iterrows():
+            for v in (r.get("window_verdicts") or []):
+                is_scan = v.get("source") == "scan"
+                scan += is_scan
+                esc += not is_scan
+                if v["class"] != "normal":
+                    scan_hit += is_scan
+                    esc_hit += not is_scan
+        print(f"  windows: {esc} escalated ({esc_hit} non-normal), "
+              f"{scan} scan-floor ({scan_hit} non-normal)")
+        if "windows_scan_floor" in df:
+            covered = int((df["windows_scan_floor"] > 0).sum())
+            print(f"  scan floor active on {covered} video(s)")
+
     if "sec_stage1" in df:
         print(f"  stage 1: {df['sec_stage1'].sum():.0f}s    "
               f"stage 2: {df['sec_stage2'].sum():.0f}s    "

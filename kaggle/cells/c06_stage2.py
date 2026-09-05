@@ -284,6 +284,77 @@ def vlm_verify(pil_frames: list, candidates: list[str]) -> dict:
     return result
 
 
+ADJUDICATE_SYSTEM = (
+    "You are a video surveillance analyst. Several separate observations were made "
+    "at the same location within a short time. Decide what single incident best "
+    "explains them together, judging only from the frames."
+)
+
+
+@torch.no_grad()
+def adjudicate_primary(pil_frames: list, observations: list[dict]) -> dict | None:
+    """Given several class verdicts inside one temporal cluster, pick the ONE
+    primary incident - by asking the model, not by consulting a causal table.
+
+    Why not a table: a static cause->consequence map has to decide once and for
+    all what smoke "means", and smoke is a symptom over a wrecked car but the
+    primary event over a thermal plant or a hillside. The same class changes
+    role with context, so any fixed tree is wrong in whichever context it did
+    not anticipate. The VLM already sees the context, so it is the right thing
+    to ask - one extra call per multi-class cluster, a handful per video.
+
+    Returns None on any failure; the caller then falls back to the highest
+    confidence observation, so this can only improve on that baseline.
+    """
+    seen = []
+    for o in sorted(observations, key=lambda o: o["t0"]):
+        seen.append(f"  - at {o['t0']:.0f}s: {o['class']} ({o['confidence']:.2f}) "
+                    f"- {o.get('description', '')[:110]}")
+    prompt = "\n".join([
+        "These observations were made at one location, in this order:",
+        *seen,
+        "",
+        "They may be several views of ONE incident, or genuinely separate things.",
+        "Pick the single class that best describes the primary incident here. If "
+        "the observations are consequences of something else visible in the frames "
+        "(for example smoke and a gathered crowd around damaged vehicles), name "
+        "that underlying incident instead.",
+        "",
+        "Reply with JSON only:",
+        '{"primary": "<one of: ' + ", ".join(ANOMALY_CLASSES) + '>", '
+        '"confidence": <0.0-1.0>, "reason": "<one short sentence>"}',
+    ])
+    try:
+        _t0 = time.time()
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": ADJUDICATE_SYSTEM}]},
+            {"role": "user", "content": [{"type": "image"} for _ in pil_frames]
+             + [{"type": "text", "text": prompt}]},
+        ]
+        text = vlm_proc.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = vlm_proc(text=[text], images=pil_frames, return_tensors="pt", padding=True)
+        inputs = {k: (v.to(vlm.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+        out = vlm.generate(**inputs, max_new_tokens=120, do_sample=False,
+                           temperature=None, top_p=None, top_k=None)
+        gen = out[0][inputs["input_ids"].shape[1]:]
+        raw = vlm_proc.decode(gen, skip_special_tokens=True)
+        _log_call("vision-language-model", (time.time() - _t0) * 1000)
+
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return None
+        d = json.loads(m.group(0))
+        cls = str(d.get("primary", "")).strip()
+        if cls not in ANOMALY_CLASSES:
+            return None
+        return {"primary": cls,
+                "confidence": max(0.0, min(1.0, float(d.get("confidence", 0.5)))),
+                "reason": str(d.get("reason", ""))[:200]}
+    except Exception as e:
+        print(f"  ! adjudication failed: {str(e).splitlines()[0][:100]}")
+        return None
+
+
 # --- smoke test ---------------------------------------------------------------
 if _probe is not None:
     _k, _ = stage1_video(_probe)
