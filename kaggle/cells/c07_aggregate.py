@@ -39,7 +39,13 @@ DEFAULT_MIN_DUR = 2.0
 # views of one accident, not two incidents. The arena scores only the
 # best-overlapping prediction per real event and counts every other one
 # against you, so fragmenting is penalised twice over.
-CLUSTER_GAP_SEC = 30.0
+# Must tolerate a scan slot or two coming back "normal" in the middle of a real
+# event. At a 20s scan interval a single normal slot opens a 40s gap, and 30s
+# split T031's fourteen agreeing congestion windows into three separate events -
+# each then emitted at the 15s fallback, turning one 125s event into three
+# fragments that the arena penalises. 60s = three scan slots.
+CROSS_CLASS_GAP_SEC = 30.0   # smoke-then-crowd: one incident seen twice
+SAME_CLASS_GAP_SEC  = 90.0   # a long ongoing event with quiet slots in it
 
 # --- how long was it, really? ------------------------------------------------
 # Our window boundaries measure OUR SAMPLING, not the event: 4 frames at 2fps is
@@ -120,16 +126,29 @@ def measure_extent(centre_t: float, health_curve, thresh: float,
     return s, e, src
 
 
-def cluster_windows(windows: list[dict], gap: float = CLUSTER_GAP_SEC) -> list[list[dict]]:
-    """Group detections into incidents by time alone - class is deliberately
-    ignored here, because one incident routinely shows up as several different
-    classes (an accident reads as smoke, then a crowd)."""
+def cluster_windows(windows: list[dict], cross_gap: float = CROSS_CLASS_GAP_SEC,
+                    same_gap: float = SAME_CLASS_GAP_SEC) -> list[list[dict]]:
+    """Group detections into incidents, with the tolerance depending on whether
+    consecutive detections agree on the class.
+
+    One gap cannot serve both cases, measured on real runs:
+      - SAME class, far apart: T031 has fourteen windows spanning 9s-311s all
+        calling traffic_congestion. Those are one ongoing event and must merge,
+        even across 40s gaps where a scan slot came back normal.
+      - DIFFERENT classes, far apart: T033's accident at 507s and an unrelated
+        detection at 385s are separate incidents. Merging them destroyed a
+        working IoU 0.59 match (it became 0.29), so cross-class merging has to
+        stay tight - it exists for smoke-then-crowd at 16s apart, not for
+        things minutes apart.
+    """
     ws = sorted((w for w in windows if w["class"] != "normal"), key=lambda w: w["t0"])
     clusters, cur = [], []
     for w in ws:
-        if cur and (w["t0"] - cur[-1]["t1"]) > gap:
-            clusters.append(cur)
-            cur = []
+        if cur:
+            gap = same_gap if w["class"] == cur[-1]["class"] else cross_gap
+            if (w["t0"] - cur[-1]["t1"]) > gap:
+                clusters.append(cur)
+                cur = []
         cur.append(w)
     if cur:
         clusters.append(cur)
@@ -175,8 +194,19 @@ def aggregate_events(windows: list[dict], cfg=None, health_curve=None,
                 main_conf = max(main_conf, verdict["confidence"])
                 reason = verdict.get("reason", "adjudicated")
 
-        centre = (min(w["t0"] for w in strong) + max(w["t1"] for w in strong)) / 2
+        # The span of the agreeing windows is itself a measurement of duration and
+        # must never be thrown away: fourteen windows spanning 9s-311s all calling
+        # congestion is direct evidence of a long event, and collapsing that to a
+        # 15s prior (as happened on T031) discards the strongest signal we have.
+        win_start = min(w["t0"] for w in strong)
+        win_end = max(w["t1"] for w in strong)
+        centre = (win_start + win_end) / 2
         start, end, src = measure_extent(centre, health_curve, thresh, duration_sec)
+        if (win_end - win_start) > (end - start):
+            start, end = win_start, win_end
+            src = "window-span"
+            if duration_sec is not None:
+                end = min(end, duration_sec)
 
         if (end - start) + 1e-6 < TEMPORAL.get(main, DEFAULT_MIN_DUR):
             continue                       # too brief to be this class
