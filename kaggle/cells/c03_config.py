@@ -106,12 +106,25 @@ class Config:
     # threshold measured to be INVERTED on three of four test videos.
     probe_escalate_p: float = 0.90
 
-    # ...and the much stricter bar for the probe to CONTRADICT stage 2. At 0.95
-    # the probe caught 353 of 484 held-out anomalies with ZERO false positives
-    # on 75 held-out normal clips. Zero on held-out TRAINING clips is not zero
-    # on 240-second test videos from other cameras, so this stays conservative
-    # and separate from the escalation bar on purpose.
-    probe_override_p: float = 0.95
+    # ...and the bar for the probe to CONTRADICT stage 2. Started at 0.95, the
+    # point where held-out training clips gave zero false positives. Real
+    # footage then said that was needlessly strict:
+    #
+    #   video   highest probe score OUTSIDE any real event
+    #   T030    0.582   <- a wholly normal video, the thing we must not flag
+    #   T026    0.670
+    #   T025    0.858
+    #
+    # T030 is the one that matters and it tops out at 0.582, so 0.90 keeps a
+    # 0.32 margin on the only video where a false alarm is possible. Dropping
+    # from 0.95 to 0.90 fires on two more of T025's six real accidents, whose
+    # in-event scores run 0.748 to 0.977.
+    #
+    # The windows this fires on OUTSIDE an event are almost all T031 and T032,
+    # where the probe believes the whole video is anomalous. Those are extent
+    # errors inside videos we already flag, not false alarms on normal ones -
+    # a different and much cheaper kind of wrong.
+    probe_override_p: float = 0.90
     probe_override_enabled: bool = True
 
 

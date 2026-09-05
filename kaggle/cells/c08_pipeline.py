@@ -166,17 +166,28 @@ def process_video(path, cfg=None, verbose=False) -> dict:
         # videos from other cameras, so this is deliberately stricter than the
         # escalation bar and switchable from CFG.
         overrode = False
-        if (getattr(cfg, "probe_override_enabled", False) and pw
+        top3 = sorted(((c, v) for c, v in pw.items() if c != "normal"),
+                      key=lambda kv: -kv[1])[:3] if pw else []
+        if (getattr(cfg, "probe_override_enabled", False) and top3
                 and verdict["class"] == "normal"
                 and p_anom >= getattr(cfg, "probe_override_p", 0.95)):
-            top = max(((c, v) for c, v in pw.items() if c != "normal"),
-                      key=lambda kv: kv[1], default=None)
-            if top:
-                verdict = {**verdict, "class": top[0], "anomaly": True,
-                           "confidence": round(float(p_anom), 3),
-                           "description": verdict.get("description", "")
-                           or f"probe: {top[0].replace('_', ' ')}"}
-                overrode = True
+            chosen, conf = top3[0][0], float(p_anom)
+            # The probe decides WHETHER; the VLM decides WHICH. Measured on
+            # T025: the probe localises five of six real accidents at IoU 0.800
+            # and calls every one of them wrong_way_driving. Its top-1 is 0.739
+            # against 0.884 for its top-3, so re-ask with those three and no
+            # "normal" - the question it failed at was never "is anything
+            # happening", it was "which of these is it".
+            pick = vlm_pick_class(pil, [c for c, _ in top3])
+            if pick:
+                chosen = pick["class"]
+                conf = max(0.5, min(float(pick.get("confidence", conf)), conf))
+            verdict = {**verdict, "class": chosen, "anomaly": True,
+                       "confidence": round(conf, 3),
+                       "description": (pick or {}).get("description")
+                       or verdict.get("description", "")
+                       or f"probe: {chosen.replace('_', ' ')}"}
+            overrode = True
 
         results.append({
             "t0": w[0]["t"],
@@ -191,9 +202,18 @@ def process_video(path, cfg=None, verbose=False) -> dict:
             # both signals stored side by side, so the next question - which of
             # these two was right, and where - is answerable offline
             "probe_anomaly": round(p_anom, 4),
-            "probe_top": (max(((c, v) for c, v in pw.items() if c != "normal"),
-                              key=lambda kv: kv[1])[0] if pw else None),
+            "probe_top": top3[0][0] if top3 else None,
+            "probe_top3": [[c, round(v, 4)] for c, v in top3],
             "probe_override": overrode,
+            # What interval does the evidence actually cover? Stage 2 looked at
+            # ~2s; the probe looked at PROBE_SPAN_SEC. When the probe is what
+            # fired, the honest claim is its span, and that is worth a great
+            # deal: probe-span extents score IoU 0.800 against five of T025's
+            # six real 20s events, where a 2s window buffered to 6s scores 0.30
+            # and fails the gate no matter how right the class is.
+            "span": ([round(centre_t - PROBE_SPAN_SEC / 2, 2),
+                      round(centre_t + PROBE_SPAN_SEC / 2, 2)]
+                     if overrode and "PROBE_SPAN_SEC" in globals() else None),
         })
     t_vlm = time.time() - t_vlm0
     n_scan = sum(1 for _, s in to_look_at if s == "scan")

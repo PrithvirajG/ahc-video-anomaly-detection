@@ -300,6 +300,66 @@ def resolve_class(raw: str) -> str:
     return squashed.get(s.replace("_", ""), "normal")
 
 
+@torch.no_grad()
+def vlm_pick_class(pil_frames: list, options: list[str]) -> dict | None:
+    """Forced choice among `options`. No "normal", because the caller already
+    decided something IS happening.
+
+    This exists for exactly one measured failure. On T025 the probe correctly
+    localises five of six real accidents - probe-span extents score IoU 0.800
+    against the ground truth - and then names every one of them
+    wrong_way_driving. Extent right, class wrong, five events lost.
+
+    The division of labour that fixes it: the PROBE decides WHETHER (98% recall,
+    from 16s of temporal context), the VLM decides WHICH (it can actually see).
+    Asking the probe to do both wastes the VLM, and the probe's top-1 is 0.739
+    against 0.884 for its top-3 - so handing the VLM those three and making it
+    choose is worth about fifteen points of class accuracy if the VLM can pick
+    at all.
+
+    Returns None on any failure, so the caller keeps the probe's own answer.
+    """
+    if not options:
+        return None
+    lines = [
+        "Something in these frames has been flagged as an incident by an "
+        "automatic system, and you should assume it is right about that.",
+        "",
+        "Your job is only to say WHICH of these it is:",
+    ]
+    for c in options:
+        lines.append(f"\n[{c}]")
+        lines += [f"  - {q}" for q in ASK_HINT.get(c, [])]
+    lines += [
+        "",
+        "Pick the single best fit even if you are unsure. Reply with JSON only:",
+        '{"class": "<one of: ' + ", ".join(options) + '>", '
+        '"confidence": <0.0-1.0>, "description": "<one short sentence>"}',
+    ]
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM}]},
+        {"role": "user", "content": [{"type": "image"} for _ in pil_frames]
+         + [{"type": "text", "text": "\n".join(lines)}]},
+    ]
+    try:
+        text = vlm_proc.apply_chat_template(messages, tokenize=False,
+                                            add_generation_prompt=True)
+        inputs = vlm_proc(text=[text], images=pil_frames, return_tensors="pt",
+                          padding=True)
+        inputs = {k: (v.to(vlm.device) if hasattr(v, "to") else v)
+                  for k, v in inputs.items()}
+        out = vlm.generate(**inputs, max_new_tokens=CFG.vlm_max_new_tokens,
+                           do_sample=False, temperature=None, top_p=None, top_k=None)
+        gen = out[0][inputs["input_ids"].shape[1]:]
+        d = parse_json_reply(vlm_proc.decode(gen, skip_special_tokens=True))
+    except Exception:
+        return None
+    # It may still answer "normal" despite not being offered it - that is the
+    # model declining the premise, and the caller's probe evidence outranks a
+    # refusal to choose, so treat it as no opinion rather than as a veto.
+    return d if d.get("class") in options else None
+
+
 def parse_json_reply(text: str) -> dict:
     """Small models wrap JSON in prose or fences often enough that a bare
     json.loads is a reliability bug, not a shortcut."""

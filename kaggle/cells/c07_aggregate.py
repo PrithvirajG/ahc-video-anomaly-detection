@@ -159,9 +159,17 @@ def measure_extent(cluster: list[dict], health_curve, thresh: float,
     consulted and "windows" when there was no curve to consult.
     """
     buf = extent_buffer(cfg)
-    s = min(w["t0"] for w in cluster)
-    e = max(w["t1"] for w in cluster)
-    src = "windows"
+    # A window may carry its own span - the interval its evidence actually
+    # covers. The probe judges PROBE_SPAN_SEC of video at a time, so when it is
+    # what fired, claiming only the ~2s stage 2 looked at understates what we
+    # know. Measured on T025: probe spans reach IoU 0.800 against five of its
+    # six real 20s events; the 2s window buffered to 6s reaches 0.30 and fails
+    # the gate however right the class is. Windows without a span fall back to
+    # their own bounds, so nothing changes where the probe was not involved.
+    lo = [w["span"][0] if w.get("span") else w["t0"] for w in cluster]
+    hi = [w["span"][1] if w.get("span") else w["t1"] for w in cluster]
+    s, e = min(lo), max(hi)
+    src = "probe-span" if any(w.get("span") for w in cluster) else "windows"
 
     if health_curve:
         ts = [t for t, _ in health_curve]
