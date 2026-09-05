@@ -35,6 +35,11 @@ wandb/
 *.faiss
 *.npy
 *.npz
+# ...except deliberate artifacts. artifacts/ holds things that are expensive to
+# recreate and cheap to store - the training embeddings there cost a 40-minute
+# GPU pass and 6 MB, so they belong in the repo rather than being regenerated
+# on every fresh Kaggle session.
+!artifacts/**
 
 # --- media ---
 *.mp4
