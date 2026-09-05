@@ -206,11 +206,26 @@ def main() -> None:
         total += m
         rows.append((f"D{lv}", m, CAP[lv], p, r, s["found"], s["total"], s["fa"]))
 
-    print(f"{'':4} {'marks':>12}  {'P':>6} {'R':>6}  {'found':>9}  {'FA':>5}")
+    # --- the arena's own layout: same columns, same order, same names --------
+    # marks | P | R | found | FA, per difficulty, left to right, then the total.
+    # Printed this way so a row can be read straight across against the public
+    # leaderboard without mentally reordering anything.
+    hdr1 = (f"{'':<13}"
+            f"{'Difficulty 1 /25':<30}{'Difficulty 2 /35':<30}"
+            f"{'Difficulty 3 /40':<30}{'Marks':>7}{'Reason':>8}{'Total':>8}")
+    hdr2 = f"{'':<13}" + "".join(
+        f"{'marks':>6}{'P':>5}{'R':>5}{'found':>9}{'FA':>5}" for _ in range(3)
+    ) + f"{'/100':>7}{'':>8}{'':>8}"
+    print(hdr1)
+    print(hdr2)
+    cells = ""
     for name, m, cap, p, r, f, t, fa in rows:
-        print(f"{name:4} {m:6.1f} /{cap:5.0f}  {100*p:5.0f}% {100*r:5.0f}%  "
-              f"{f:4d}/{t:<4d}  {fa:5d}")
-    print(f"{'':4} {total:6.1f} / 100.0   <- estimated, see the docstring")
+        cells += f"{m:6.1f}{100*p:4.0f}%{100*r:4.0f}%{f:5d}/{t:<3d}{fa:5d}"
+    print(f"{'this run':<13}{cells}{total:7.1f}{'-':>8}{total:8.1f}")
+    print()
+    print("  Reason is the arena's description bonus (+1.0 to +4.0). It is not")
+    print("  computed here - the arena awards it, so this column always reads '-'")
+    print("  and Total equals Marks.")
     print()
     print("  P/R use the LEADERBOARD convention: FA counts every unmatched")
     print("  prediction, wrong-class ones included. Verified against the arena's")
