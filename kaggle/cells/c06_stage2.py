@@ -234,6 +234,37 @@ SYSTEM = (
 )
 
 
+# A queue of stopped cars is what an accident LOOKS like from above once the
+# first second is over, and the label is the accident. Measured on T025, where
+# the truth is six traffic_accident events and, given all eleven classes and no
+# constraint, the model wrote:
+#
+#   "A dense queue of vehicles is stopped or moving very slowly on the highway."
+#   "A long queue of trucks and cars is stationary at the service area entrance,
+#    indicating traffic congestion."
+#
+# Those are accurate descriptions and the wrong answer. The ASK-HINT questions
+# for traffic_accident are good ones - vehicles in contact, visible damage,
+# people gathered - and the model answered them honestly with "no", then picked
+# the class whose questions it could answer "yes" to. Nothing about that is a
+# failure of prompting the individual classes; what was missing is an ordering
+# between them.
+#
+# Note what this deliberately is NOT: a lookup table mapping consequence to
+# cause. We rejected that earlier and the reasoning still holds - smoke over a
+# wrecked car is a symptom, smoke over a thermal plant is the incident, and no
+# table can tell those apart. This asks the model to LOOK for a cause before
+# settling on an effect, and leaves the judgement where the eyes are.
+CAUSE_BEFORE_EFFECT = (
+    "One ordering rule. Stopped traffic, a queue, a blocked lane and a crowd are "
+    "usually consequences of something else. If you see one, look at the head of "
+    "the queue or the centre of the crowd before you answer: a collision, a "
+    "damaged or overturned vehicle, debris, water or fire there is the incident, "
+    "and the queue is only its effect. Report the cause when you can see one, and "
+    "the effect only when you cannot."
+)
+
+
 def build_prompt(hint_classes: list[str]) -> str:
     """Ask about the shortlisted classes; accept an answer from all eleven.
 
@@ -274,6 +305,8 @@ def build_prompt(hint_classes: list[str]) -> str:
         "",
         "If a red circle or square is drawn on a frame, it marks where motion was "
         "detected - look there first, but judge the whole frame.",
+        "",
+        CAUSE_BEFORE_EFFECT,
         "",
         "Reply with JSON only, no other text:",
         '{"anomaly": true|false, "class": "<one of: '
@@ -344,6 +377,8 @@ def vlm_pick_class(pil_frames: list, options: list[str]) -> dict | None:
         lines.append(f"\n[{c}]")
         lines += [f"  - {q}" for q in ASK_HINT.get(c, [])]
     lines += [
+        "",
+        CAUSE_BEFORE_EFFECT,
         "",
         "Pick the single best fit even if you are unsure. Reply with JSON only:",
         '{"class": "<one of: ' + ", ".join(ANOMALY_CLASSES) + '>", '
