@@ -27,6 +27,34 @@
 #     match; the rest count AGAINST you - our per-class merge_gap in cell 7 is
 #     exactly what keeps this from happening, so don't loosen it casually
 
+# The arena's practice manifest, embedded: {video_id: (level, duration_sec)}.
+#
+# It is here rather than read from a file because the file lives in the repo and
+# the notebook runs on Kaggle, where nothing mounts it - so practice mode was
+# silently falling through to the ground-truth CSV, which carries levels but NOT
+# durations. That left the end_time_sec bounds check using our own decoded
+# duration, which is short by up to 2.7s (T033 626.1 against the arena's 628.8),
+# and short durations trim real overlap off exactly the long D3 events that pay
+# five marks each.
+#
+# 34 entries is small enough to embed and large enough that a divergence would
+# matter, so _check_embedded_manifest() below cross-checks it against GT_TEST at
+# import time rather than trusting it to stay correct.
+EMBEDDED_MANIFEST = {
+    "T001": (1, 5.7), "T002": (1, 5.8), "T003": (1, 14.0),
+    "T004": (1, 14.0), "T005": (1, 5.7), "T006": (1, 17.0),
+    "T007": (1, 22.7), "T008": (1, 5.7), "T009": (1, 5.8),
+    "T010": (1, 13.2), "T011": (1, 11.2), "T012": (1, 5.8),
+    "T013": (1, 5.8), "T014": (1, 5.8), "T015": (1, 5.8),
+    "T016": (1, 5.7), "T017": (1, 5.7), "T018": (1, 11.1),
+    "T019": (1, 13.3), "T020": (1, 26.1), "T021": (1, 20.3),
+    "T022": (1, 16.0), "T023": (1, 20.0), "T024": (1, 16.0),
+    "T025": (2, 240.0), "T026": (2, 240.0), "T027": (2, 240.0),
+    "T028": (2, 240.0), "T029": (2, 240.0), "T030": (2, 240.0),
+    "T031": (3, 360.0), "T032": (3, 307.7), "T033": (3, 628.8),
+    "T034": (3, 376.5),
+}
+
 # In eval mode the manifest ships inside the dataset itself, so there is nothing
 # to fetch by hand and no chance of scoring against a stale copy. A file dropped
 # into WORK still wins, which is the escape hatch if the arena reissues one.
@@ -34,26 +62,67 @@ _WORK_MANIFEST = WORK / "manifest.json"
 MANIFEST_PATH = (_WORK_MANIFEST if _WORK_MANIFEST.exists()
                  else (EVAL_MANIFEST_PATH if MODE == "eval" and EVAL_MANIFEST_PATH
                        else _WORK_MANIFEST))
-print(f"manifest: {MANIFEST_PATH}"
-      f"{'' if MANIFEST_PATH.exists() else '  (absent - falling back to local truth)'}")
 
 
-def load_manifest() -> dict[str, int]:
-    """{video_id: level} for every video the arena wants an answer for.
+def _manifest_videos() -> tuple[list[dict], str]:
+    """[{video_id, level, duration_sec}, ...] plus where it came from.
 
-    Falls back to the local public test set's own ground truth so this cell is
-    fully testable before the real manifest exists. Swap in the real file and
-    everything below is unchanged.
+    One resolver for both loaders below, so the level map and the duration map
+    can never disagree about which source they read.
     """
     if MANIFEST_PATH.exists():
         m = json.loads(MANIFEST_PATH.read_text())
         videos = m.get("videos", m if isinstance(m, list) else [])
         # the general PDF calls this field "level"; the live benchmark page's
         # own prose calls it "difficulty" - accept either rather than guess
-        return {v["video_id"]: int(v.get("level", v.get("difficulty")))
-                for v in videos}
-    print(f"no manifest at {MANIFEST_PATH} - using the local test set's ground "
-          "truth as a stand-in so this cell is testable right now")
+        return ([{"video_id": v["video_id"],
+                  "level": int(v.get("level", v.get("difficulty"))),
+                  "duration_sec": (float(v["duration_sec"])
+                                   if "duration_sec" in v else None)}
+                 for v in videos], str(MANIFEST_PATH))
+    if MODE != "eval" and EMBEDDED_MANIFEST:
+        return ([{"video_id": k, "level": lv, "duration_sec": d}
+                 for k, (lv, d) in sorted(EMBEDDED_MANIFEST.items())],
+                "embedded practice manifest")
+    return [], "none"
+
+
+_MANIFEST_VIDEOS, MANIFEST_SOURCE = _manifest_videos()
+print(f"manifest: {MANIFEST_SOURCE}  ({len(_MANIFEST_VIDEOS)} videos)")
+
+
+def _check_embedded_manifest() -> None:
+    """Cross-check the embedded copy against the mounted ground truth.
+
+    An embedded constant is a copy, and copies drift. This is cheap and turns a
+    silent wrong-level submission into a printed warning.
+    """
+    if MANIFEST_SOURCE != "embedded practice manifest" or GT_TEST.empty:
+        return
+    gt_lv = (GT_TEST.drop_duplicates("video_id")
+             .set_index("video_id")["level"].astype(int).to_dict())
+    emb = {v["video_id"]: v["level"] for v in _MANIFEST_VIDEOS}
+    if set(emb) != set(gt_lv):
+        print(f"  ! embedded manifest / ground truth disagree on which videos "
+              f"exist: only-embedded={sorted(set(emb) - set(gt_lv))}, "
+              f"only-truth={sorted(set(gt_lv) - set(emb))}")
+    bad = {k: (emb[k], gt_lv[k]) for k in set(emb) & set(gt_lv) if emb[k] != gt_lv[k]}
+    if bad:
+        print(f"  ! embedded manifest / ground truth disagree on levels: {bad}")
+    if not bad and set(emb) == set(gt_lv):
+        print(f"  embedded manifest agrees with ground truth on all "
+              f"{len(emb)} videos (ids and levels)")
+
+
+_check_embedded_manifest()
+
+
+def load_manifest() -> dict[str, int]:
+    """{video_id: level} for every video the arena wants an answer for."""
+    if _MANIFEST_VIDEOS:
+        return {v["video_id"]: v["level"] for v in _MANIFEST_VIDEOS}
+    print("no manifest available - using the local test set's ground truth as a "
+          "stand-in so this cell is testable right now")
     return (GT_TEST.drop_duplicates("video_id")
             .set_index("video_id")["level"].astype(int).to_dict())
 
@@ -62,12 +131,8 @@ def load_manifest_durations() -> dict[str, float]:
     """video_id -> duration_sec, straight from the manifest when we have one -
     more authoritative than our own decoded duration for the 'end_time_sec must
     stay inside the duration' check. Falls back to PRED's measured duration."""
-    if MANIFEST_PATH.exists():
-        m = json.loads(MANIFEST_PATH.read_text())
-        videos = m.get("videos", m if isinstance(m, list) else [])
-        return {v["video_id"]: float(v["duration_sec"])
-                for v in videos if "duration_sec" in v}
-    return {}
+    return {v["video_id"]: v["duration_sec"] for v in _MANIFEST_VIDEOS
+            if v.get("duration_sec") is not None}
 
 
 def events_for_submission(pred_row: dict, level: int) -> list[dict]:
