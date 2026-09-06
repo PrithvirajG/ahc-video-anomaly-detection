@@ -136,7 +136,27 @@ class Config:
     # where the evidence is, and the token cost stays flat. vlm_crop_context is
     # how much of the surroundings to keep - a tight crop of a wreck with no road
     # around it is its own kind of unanswerable.
-    vlm_crop_to_motion: bool = True
+    # REVERTED to False after measuring it, same as the widening above. The crop
+    # worked exactly as designed - a small motion box went from 6% of the frame
+    # to 25% of the delivered image at native pixels - and changed nothing that
+    # mattered. T025's description came back word-for-word identical to the
+    # 640-downscale version, "a dense queue of vehicles is stopped or moving
+    # very slowly on the left side of the highway", with one clause reworded.
+    #
+    # It also cost. Cropping tight on T032 turned a stationary three-wheeler
+    # into something the model reads as a collision: loitering verdicts fell
+    # 10 to 7 and three traffic_accident appeared, flipping a correct
+    # video-level class. Class accuracy 0.75 to 0.50, plus 2.2 minutes.
+    #
+    # Taken with the widening result this is a clean three-way control. Same
+    # footage, same question, and the model returns the same sentence whether it
+    # gets 2 seconds or 16, 640px or native pixels on the region of interest.
+    # It is not being starved of evidence - that is genuinely what it sees.
+    #
+    # Both code paths are kept and defaulted off. They are the right levers for
+    # a model that can use them, which is now the open question rather than
+    # something to keep tuning here.
+    vlm_crop_to_motion: bool = False
     vlm_crop_context: float = 3.0   # multiple of the motion box to include
     vlm_crop_min_px: int = 320      # never crop below this, small boxes need room
 
