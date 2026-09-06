@@ -70,23 +70,40 @@ class Config:
     # load_vlm() for the VRAM math and the organizer-referenced papers that
     # independently validate this exact model for this exact task.
     vlm_id: str = "Qwen/Qwen3-VL-4B-Instruct"
-    vlm_frames: int = 8            # frames per escalated window
+    vlm_frames: int = 4            # frames per escalated window
     vlm_max_new_tokens: int = 160
 
-    # How much TIME those frames span. Was implicitly ~2s - four consecutive
-    # samples at 2fps - and that is the measured cause of our worst remaining
-    # error. On T025, given every class and an explicit instruction to look for
-    # the cause, the model wrote "a dense queue of vehicles is stopped or moving
-    # very slowly" and answered traffic_congestion. The truth is
-    # traffic_accident. Four frames of a queue IS a queue: a collision is over
-    # in about a second and what remains is its aftermath, so a 2s look at any
-    # moment after impact cannot contain the evidence that separates the two.
+    # REVERTED to 0 (no widening) after measuring it. The theory was that four
+    # consecutive samples at 2fps give the model ~2s, too little to separate a
+    # collision from the queue it causes. Widening to 8 frames over 16s produced
+    # word-for-word identical descriptions on T025 - "a dense queue of vehicles
+    # is stopped or moving very slowly on the left side of the highway", before
+    # and after - so the extra span bought nothing.
     #
-    # 16s matches the probe's span, so both stages now judge the same width of
-    # video, and it is the median real event length. Costs roughly double in
-    # stage 2, which is 82% of wall time - about 9 minutes becoming 14 on the
-    # five-video set.
-    vlm_span_sec: float = 16.0
+    # It also cost: a 16s span on T032 pulls more scene into view, the model
+    # names whatever is most salient across it, and its verdicts went from
+    # loitering 10 / stalled 6 to loitering 6 / stalled 6 / accident 3, flipping
+    # a correct video-level class to a wrong one. Class accuracy 0.75 -> 0.50,
+    # and +3.1 minutes.
+    #
+    # Set to 16.0 to re-enable; the code path is kept because the idea is sound
+    # for a model that can actually resolve the detail, which is the next knob.
+    vlm_span_sec: float = 0.0
+
+    # THE ACTUAL CONSTRAINT, measured after the above failed. The test videos are
+    # 1280x720 and max_side downscales them to 640x360, discarding 75% of the
+    # pixels. On a drone shot of a highway, two vehicles in contact occupy a few
+    # dozen pixels at that scale - the model is not failing to reason about
+    # damage, it is being handed frames where the damage is gone.
+    #
+    # Rather than send every frame at full size, crop to the motion region the
+    # gate already located and send THAT at native resolution: the detail lands
+    # where the evidence is, and the token cost stays flat. vlm_crop_context is
+    # how much of the surroundings to keep - a tight crop of a wreck with no road
+    # around it is its own kind of unanswerable.
+    vlm_crop_to_motion: bool = True
+    vlm_crop_context: float = 3.0   # multiple of the motion box to include
+    vlm_crop_min_px: int = 320      # never crop below this, small boxes need room
 
     # --- temporal aggregation --------------------------------------------
     enter_conf: float = 0.55       # stage-2 confidence to open an event

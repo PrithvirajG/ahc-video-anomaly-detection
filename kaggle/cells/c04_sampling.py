@@ -125,6 +125,59 @@ def to_pil(frame):
     return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
 
+def native_crop(cap, t: float, box, small_wh, cfg=None):
+    """Re-read frame `t` at NATIVE resolution and crop around the motion box.
+
+    Stage 0 stores frames already downscaled to max_side, because that is all
+    the motion gate and the encoder need. Stage 2 needs more: the test videos
+    are 1280x720 and max_side 640 discards 75% of the pixels, so on a drone shot
+    of a highway two vehicles in contact are a few dozen pixels by the time the
+    VLM sees them. Measured consequence - given 2s or 16s of that footage the
+    model writes the same sentence, "a dense queue of vehicles is stopped or
+    moving very slowly", because the damage that would make it an accident is
+    no longer in the image to describe.
+
+    So spend a seek on the frames stage 2 actually looks at, and crop to where
+    the motion was, keeping cfg.vlm_crop_context times the box for surroundings
+    - a tight crop of a wreck with no road around it is its own kind of
+    unanswerable. Downscaling only happens if the crop is still larger than
+    max_side, so a modest box comes back at full detail and the token cost is
+    unchanged.
+
+    Returns None whenever anything is missing, so the caller keeps the frame it
+    already has.
+    """
+    cfg = cfg or CFG
+    if cap is None or box is None or not getattr(cfg, "vlm_crop_to_motion", False):
+        return None
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(t * fps)))
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        return None
+
+    H, W = frame.shape[:2]
+    sw, sh = small_wh
+    if not sw or not sh:
+        return None
+    # box is in the DOWNSCALED frame's pixel space; map it back up
+    fx, fy = W / float(sw), H / float(sh)
+    x, y, w, h = box
+    cx, cy = (x + w / 2) * fx, (y + h / 2) * fy
+    half_w = max(w * fx * cfg.vlm_crop_context, cfg.vlm_crop_min_px) / 2
+    half_h = max(h * fy * cfg.vlm_crop_context, cfg.vlm_crop_min_px) / 2
+    x0, x1 = int(max(0, cx - half_w)), int(min(W, cx + half_w))
+    y0, y1 = int(max(0, cy - half_h)), int(min(H, cy + half_h))
+    if x1 - x0 < 32 or y1 - y0 < 32:
+        return None
+    crop = frame[y0:y1, x0:x1]
+    ch, cw = crop.shape[:2]
+    if max(ch, cw) > cfg.max_side:
+        s = cfg.max_side / max(ch, cw)
+        crop = cv2.resize(crop, (int(cw * s), int(ch * s)))
+    return crop
+
+
 def sample_video(path, cfg=None):
     """Full stage-0 pass. Returns the frames that survive the gate."""
     cfg = cfg or CFG

@@ -155,6 +155,11 @@ def process_video(path, cfg=None, verbose=False) -> dict:
     duration_full = video_duration(path)
     to_look_at = add_scan_floor(windows, kept, duration_full, cfg)
 
+    # One capture reused across every window of this video - reopening the file
+    # per frame would cost more than the seeks themselves.
+    _native_cap = (cv2.VideoCapture(str(path))
+                   if getattr(cfg, "vlm_crop_to_motion", False) else None)
+
     results = []
     t_vlm0 = time.time()
     for w, source in to_look_at:
@@ -165,8 +170,22 @@ def process_video(path, cfg=None, verbose=False) -> dict:
         # below an honest claim rather than an assumed one.
         widened = widen_window(kept, centre_t, cfg)
         picked = widened or pick_frames(w, cfg.vlm_frames)
-        pil = [to_pil(draw_visual_prompt(r["frame"], r["box"], cfg.visual_prompt))
-               for r in picked]
+        # Crop to the motion region at NATIVE resolution where we can. The
+        # stored frame is already downscaled to max_side, which on 1280x720
+        # source throws away 75% of the pixels - and the evidence that separates
+        # a collision from the queue behind it lives in those pixels. One seek
+        # per frame stage 2 actually looks at, about 39s across a five-video
+        # run, and the token count does not change because the crop is
+        # downscaled only if it is still larger than max_side.
+        pil = []
+        for r in picked:
+            crop = native_crop(_native_cap, r["t"], r["box"],
+                               (r["frame"].shape[1], r["frame"].shape[0]), cfg)
+            if crop is not None:
+                pil.append(to_pil(crop))      # already centred on the motion
+            else:
+                pil.append(to_pil(draw_visual_prompt(r["frame"], r["box"],
+                                                     cfg.visual_prompt)))
         emb = embed_images(pil)
         # The probe sees 16s around this moment, not the ~2s the VLM sees, and
         # it costs nothing: stage 1 already encoded these frames and cell 5 now
@@ -253,6 +272,8 @@ def process_video(path, cfg=None, verbose=False) -> dict:
                       round(picked[-1]["t"] + 1.0 / cfg.sample_fps, 2)]
                      if widened else None),
         })
+    if _native_cap is not None:
+        _native_cap.release()
     t_vlm = time.time() - t_vlm0
     n_scan = sum(1 for _, s in to_look_at if s == "scan")
 
