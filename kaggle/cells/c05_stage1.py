@@ -83,17 +83,28 @@ RULES = NORMAL_RULES + PERTURBED_ACTIONS
 RULE_W = torch.tensor([1.0] * len(NORMAL_RULES) + [-1.0] * len(PERTURBED_ACTIONS))
 
 # --- encoder ------------------------------------------------------------------
-try:
-    processor = AutoProcessor.from_pretrained(CFG.encoder_id)
-    encoder = AutoModel.from_pretrained(CFG.encoder_id, torch_dtype=DTYPE)
-except Exception as e:
-    print(f"{CFG.encoder_id} unavailable ({str(e).splitlines()[0][:120]});"
-          " falling back to CLIP-B/16")
-    CFG.encoder_id = "openai/clip-vit-base-patch16"
-    processor = AutoProcessor.from_pretrained(CFG.encoder_id)
-    encoder = AutoModel.from_pretrained(CFG.encoder_id, torch_dtype=DTYPE)
-
-encoder = encoder.to(DEVICE).eval()
+# Re-running this cell must not load a second copy alongside the first. Reuse
+# when the same encoder is already resident, and free the old weights before
+# loading when it is not - see free_cuda() in cell 3 for why the rebind alone
+# is not enough.
+if globals().get("_ENCODER_ID") == CFG.encoder_id and "encoder" in globals():
+    print(f"encoder: {CFG.encoder_id} already loaded, reusing "
+          f"({torch.cuda.memory_allocated() / 1e9:.2f} GB in use)"
+          if DEVICE == "cuda" else
+          f"encoder: {CFG.encoder_id} already loaded, reusing")
+else:
+    free_cuda("encoder", "processor")
+    try:
+        processor = AutoProcessor.from_pretrained(CFG.encoder_id)
+        encoder = AutoModel.from_pretrained(CFG.encoder_id, torch_dtype=DTYPE)
+    except Exception as e:
+        print(f"{CFG.encoder_id} unavailable ({str(e).splitlines()[0][:120]});"
+              " falling back to CLIP-B/16")
+        CFG.encoder_id = "openai/clip-vit-base-patch16"
+        processor = AutoProcessor.from_pretrained(CFG.encoder_id)
+        encoder = AutoModel.from_pretrained(CFG.encoder_id, torch_dtype=DTYPE)
+    encoder = encoder.to(DEVICE).eval()
+    _ENCODER_ID = CFG.encoder_id
 IS_SIGLIP = "siglip" in CFG.encoder_id.lower()
 print(f"encoder: {CFG.encoder_id}  {sum(p.numel() for p in encoder.parameters()) / 1e6:.0f}M params")
 

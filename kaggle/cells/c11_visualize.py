@@ -103,7 +103,7 @@ for vid in GALLERY_VIDEO_IDS:
     plt.imshow(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     plt.title(vid)
     plt.axis("off")
-    out_path = RUNS / "gallery" / f"{vid}.png"
+    out_path = RUNS / "gallery" / f"{vid}_{RUN_ID}.png"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=110, bbox_inches="tight")
     plt.show()
@@ -131,7 +131,7 @@ def make_live_check_video(video_id: str, cfg=None) -> Path | None:
     health_scores = health(embed_images(imgs)).tolist()
 
     h, w = kept[0]["frame"].shape[:2]
-    out_path = RUNS / f"live_check_{video_id}.mp4"
+    out_path = run_path(f"live_check_{video_id}.mp4")
     writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
                              max(cfg.sample_fps, 2.0), (w, h))
 
@@ -203,7 +203,7 @@ def plot_incident_timeline(video_id: str):
                 ha="right", fontsize=8, color="#2a2")
 
     plt.tight_layout()
-    out = RUNS / "gallery" / f"timeline_{video_id}.png"
+    out = RUNS / "gallery" / f"timeline_{video_id}_{RUN_ID}.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out, dpi=110, bbox_inches="tight")
     plt.show()
@@ -226,6 +226,7 @@ for _vid in [v for v in GALLERY_VIDEO_IDS if (pred_row(v) or {}).get("events")]:
 
 # full structure, sub-tags included, for later analysis - deliberately separate
 # from the arena file, which only ever carries the single main tag per event
-(RUNS / "incidents_detailed.json").write_text(json.dumps(
+_inc = run_path("incidents_detailed.json")
+_inc.write_text(json.dumps(
     [r for r in PRED.to_dict("records") if r.get("events")], indent=1, default=str))
-print(f"\nwrote {RUNS / 'incidents_detailed.json'} (main tags + sub-tags + provenance)")
+print(f"\nwrote {_inc} (main tags + sub-tags + provenance)")

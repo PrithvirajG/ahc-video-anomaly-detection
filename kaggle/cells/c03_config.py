@@ -14,6 +14,41 @@ import torch
 RUNS = WORK / "runs"
 RUNS.mkdir(parents=True, exist_ok=True)
 
+# Every output carries the timestamp of the run that produced it. Without this
+# each run overwrites the last, and once a few are downloaded you are left
+# guessing which "predictions_raw (7).json" came from which set of changes -
+# which matters here, because comparing runs against each other is how nearly
+# every finding in this project was made.
+RUN_ID = time.strftime("%Y%m%d-%H%M%S")
+
+
+def run_path(name: str) -> Path:
+    """runs/<stem>_<RUN_ID><suffix>, e.g. runs/predictions_raw_20260906-011530.json"""
+    p = Path(name)
+    return RUNS / f"{p.stem}_{RUN_ID}{p.suffix}"
+
+
+def free_cuda(*names: str) -> float:
+    """Drop the named globals and hand their VRAM back. Returns GB still in use.
+
+    Re-running a model cell in a notebook rebinds the name but does NOT free the
+    old weights - the previous module is still referenced until the rebind
+    completes, so for a moment two copies of a 9GB model are resident, and on a
+    16GB T4 that is an out-of-memory error rather than a slow moment. Deleting
+    the name first makes the load work at the cost of a reload; the callers
+    below skip even that when the same model is already in memory.
+    """
+    import gc
+    g = globals()
+    for n in names:
+        if n in g:
+            del g[n]
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return torch.cuda.memory_allocated() / 1e9
+    return 0.0
+
 
 @dataclass
 class Config:

@@ -221,8 +221,20 @@ def load_vlm(model_id=None):
     return m, proc
 
 
-vlm, vlm_proc = load_vlm()
-print(f"vlm: {CFG.vlm_id} loaded on {DEVICE}")
+# The VLM is ~9-10GB in fp16 and the T4 has 16, so a second copy does not fit.
+# Re-running this cell rebinds `vlm` but the old module stays referenced until
+# the new one is built, which means two copies momentarily resident and a CUDA
+# out-of-memory error rather than a slow reload. Reuse when it is already here,
+# and free before loading when it is not.
+if globals().get("_VLM_ID") == CFG.vlm_id and "vlm" in globals():
+    print(f"vlm: {CFG.vlm_id} already loaded, reusing")
+else:
+    if "_VLM_ID" in globals():
+        _free = free_cuda("vlm", "vlm_proc")
+        print(f"vlm: freed the previous model ({_free:.2f} GB still in use)")
+    vlm, vlm_proc = load_vlm()
+    _VLM_ID = CFG.vlm_id
+    print(f"vlm: {CFG.vlm_id} loaded on {DEVICE}")
 if DEVICE == "cuda":
     print(f"     VRAM in use: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 

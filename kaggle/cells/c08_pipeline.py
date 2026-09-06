@@ -446,5 +446,6 @@ ONLY_VIDEOS = ["T025", "T026", "T030", "T031", "T032"]
 LIMIT = None
 PRED = run_split(GT_TEST if not GT_TEST.empty else GT_TRAIN,
                  limit=LIMIT, only=ONLY_VIDEOS)
-PRED.to_json(RUNS / "predictions_raw.json", orient="records", indent=1)
-print(f"\nwrote {RUNS / 'predictions_raw.json'}")
+_pred_out = run_path("predictions_raw.json")
+PRED.to_json(_pred_out, orient="records", indent=1)
+print(f"\nwrote {_pred_out}")

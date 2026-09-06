@@ -143,7 +143,9 @@ if not HAS_TRUTH:
     print("  - cell 11: eyeball a few frames and one full video replay")
 else:
     METRICS = evaluate(PRED, GT_TEST)
-    (RUNS / "metrics.json").write_text(json.dumps(METRICS, indent=2))
+    _m = run_path("metrics.json")
+    _m.write_text(json.dumps(METRICS, indent=2))
+    print(f"wrote {_m}")
 
 
 # The arena submission is a different, stricter schema (JSON, private video

@@ -258,7 +258,7 @@ VIDEO_DURATIONS = (load_manifest_durations()
                   or dict(zip(PRED["video_id"], PRED.get("duration_sec", []))))
 PROBLEMS = validate_submission(SUBMISSION, MANIFEST, VIDEO_DURATIONS)
 
-OUT_PATH = RUNS / "arena_submission.json"
+OUT_PATH = run_path("arena_submission.json")
 OUT_PATH.write_text(json.dumps(SUBMISSION, indent=1))
 size_kb = OUT_PATH.stat().st_size / 1024
 print(f"\nwrote {OUT_PATH}  ({size_kb:.1f} KB of the 5 MB cap, "
