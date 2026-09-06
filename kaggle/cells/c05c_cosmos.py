@@ -39,6 +39,79 @@ COSMOS_FRAMES = 8          # the shape it was trained at
 COSMOS_DIAG_VIDEOS = ["T025", "T032", "T026"]
 
 
+def _shim_transformers_for_cosmos() -> list[str]:
+    """Put back the helpers Cosmos's vendored QFormer imports from
+    transformers.modeling_utils, which no longer exports them.
+
+    The failure is a hard one and worth naming precisely:
+
+        cannot import name 'apply_chunking_to_forward'
+        from 'transformers.modeling_utils'
+
+    Cosmos ships its own modeling code via trust_remote_code, written against a
+    transformers where the BERT-era helpers still lived in modeling_utils. They
+    moved to pytorch_utils and activations, and the compatibility re-exports
+    were dropped - Kaggle's image is transformers 5.x, so the import fails at
+    load time.
+
+    Pinning an older transformers is not an option: Qwen3-VL needs a recent one,
+    and downgrading to satisfy Cosmos would break stage 2. Pinning a model
+    revision does not help either, since the vendored code is the same at every
+    revision. So re-export what still exists, reimplement the one small pure
+    function that does not, and leave loud stubs for the rest - all three prune
+    helpers are used only by prune_heads(), which inference never calls, so a
+    stub that raises is strictly better than a wrong implementation.
+    """
+    import transformers.modeling_utils as mu
+    patched = []
+
+    def _adopt(name, module_path):
+        if hasattr(mu, name):
+            return
+        try:
+            import importlib
+            src = importlib.import_module(module_path)
+            setattr(mu, name, getattr(src, name))
+            patched.append(f"{name} <- {module_path}")
+        except Exception:
+            pass
+
+    for n in ("apply_chunking_to_forward", "prune_linear_layer", "Conv1D",
+              "meshgrid"):
+        _adopt(n, "transformers.pytorch_utils")
+    _adopt("get_activation", "transformers.activations")
+
+    if not hasattr(mu, "find_pruneable_heads_and_indices"):
+        def find_pruneable_heads_and_indices(heads, n_heads, head_size,
+                                             already_pruned_heads):
+            """Verbatim behaviour of the removed transformers helper."""
+            mask = torch.ones(n_heads, head_size)
+            heads = set(heads) - already_pruned_heads
+            for head in heads:
+                head = head - sum(1 if h < head else 0
+                                  for h in already_pruned_heads)
+                mask[head] = 0
+            mask = mask.view(-1).contiguous().eq(1)
+            index = torch.arange(len(mask))[mask].long()
+            return heads, index
+
+        mu.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
+        patched.append("find_pruneable_heads_and_indices (reimplemented)")
+
+    for n in ("prune_conv1d_layer", "prune_layer"):
+        if not hasattr(mu, n):
+            def _gone(*a, _n=n, **k):
+                raise NotImplementedError(
+                    f"{_n} was removed from transformers and is only reachable "
+                    "through prune_heads(), which inference does not call. If "
+                    "you are seeing this, something is pruning attention heads "
+                    "and that needs a real implementation, not this stub.")
+            setattr(mu, n, _gone)
+            patched.append(f"{n} (stub)")
+
+    return patched
+
+
 def load_cosmos(model_id: str = COSMOS_ID):
     """Load Cosmos-Embed1, picking a dtype the GPU can actually run.
 
@@ -52,6 +125,10 @@ def load_cosmos(model_id: str = COSMOS_ID):
     enabled. That is a real precondition, not a detail.
     """
     from transformers import AutoModel, AutoProcessor
+    import transformers
+    _p = _shim_transformers_for_cosmos()
+    print(f"cosmos: transformers {transformers.__version__}"
+          + (f", shimmed {len(_p)} helpers: {', '.join(_p)}" if _p else ""))
     last = None
     for dt in (torch.float16, torch.float32):
         try:
