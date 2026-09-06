@@ -33,6 +33,39 @@
 # Leaderboard context: entrant #23 scored 40.4 running this model bare, above
 # our 37.5, and #16 got 47.1 with a LoRA on top.
 
+# --- COSMOS_VERSION_NOTE: this does not work on transformers 5.x -------------
+# Cosmos ships its modeling code through trust_remote_code, written against
+# transformers 4.x. Kaggle's image is 5.x, and the incompatibilities are a
+# cascade rather than a single fix. Every one of these was hit in order, and the
+# shims below handle the first six:
+#
+#   1. apply_chunking_to_forward gone from modeling_utils   -> re-exported
+#   2. "Tensor.item() cannot be called on meta tensors"     -> low_cpu_mem_usage=False
+#   3. logit_scale/logit_bias shape [1] vs scalar           -> ignore_mismatched_sizes
+#   4. no attribute 'all_tied_weights_keys'                 -> property shim
+#   5. no attribute 'get_head_mask'                         -> reimplemented
+#   6. tokenizer has no pad token                           -> pad = [PAD] (id 0)
+#   7. video tower returns all-NaN                          -> NOT FIXABLE HERE
+#
+# Number 7 is where this stops. Measured: 0 of 819 parameters are NaN or Inf,
+# none are all-zero, the text tower returns correctly L2-normalised embeddings
+# (norms exactly 1.0), and the video tower returns NaN for BOTH uint8 0..255 and
+# float32 0..1 inputs in fp32. Clean weights, valid input, broken arithmetic -
+# so the fault is inside the vendored forward pass meeting a newer torch or
+# transformers, not anything reachable from here.
+#
+# Pinning transformers in THIS notebook is not an option: Qwen3-VL needs a
+# recent one, and cell 6 is the stage this diagnostic exists to inform.
+#
+# THE WORKING PATH, if you want this answer: a separate Kaggle notebook.
+#
+#     !pip install -q "transformers<5" "tokenizers<0.21"
+#     # restart the kernel, internet ON
+#     # then cells 1-4 of this notebook plus this cell, nothing else
+#
+# It needs no Qwen, no probe and no SigLIP2 - only sample_video() and the
+# ground truth - so it is a small standalone notebook rather than a port.
+
 COSMOS_ENABLED = False
 COSMOS_ID = "nvidia/Cosmos-Embed1-448p-anomaly-detection"
 COSMOS_FRAMES = 8          # the shape it was trained at
@@ -109,6 +142,54 @@ def _shim_transformers_for_cosmos() -> list[str]:
             setattr(mu, n, _gone)
             patched.append(f"{n} (stub)")
 
+    # --- and two things transformers expects OF the model ---------------------
+    from transformers import PreTrainedModel
+
+    # 5.x reads all_tied_weights_keys (a mapping) during _finalize_model_loading;
+    # 4.x-era code sets _tied_weights_keys (often a list). Without this the load
+    # dies AFTER the weights are read, with
+    #   'CosmosEmbed1' object has no attribute 'all_tied_weights_keys'
+    if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+        @property
+        def _all_tied(self):
+            v = getattr(self, "_tied_weights_keys", None) or {}
+            return v if isinstance(v, dict) else {k: k for k in v}
+        PreTrainedModel.all_tied_weights_keys = _all_tied
+        patched.append("all_tied_weights_keys (from _tied_weights_keys)")
+
+    # get_head_mask came from ModuleUtilsMixin and is gone in 5.x. This one is
+    # in the FORWARD path, so it fails after a successful load - and it is the
+    # only such gap: the vendored code also calls get_extended_attention_mask
+    # and invert_attention_mask, both of which still exist. That was worth
+    # checking rather than assuming, because a forward-path cascade would have
+    # meant abandoning this for a pinned-transformers notebook instead.
+    if not hasattr(PreTrainedModel, "get_head_mask"):
+        def _convert_head_mask_to_5d(self, head_mask, num_hidden_layers):
+            if head_mask.dim() == 1:
+                head_mask = (head_mask.unsqueeze(0).unsqueeze(0)
+                             .unsqueeze(-1).unsqueeze(-1))
+                head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+            return head_mask.to(dtype=self.dtype)
+
+        def get_head_mask(self, head_mask, num_hidden_layers,
+                          is_attention_chunked: bool = False):
+            """Behaviour of the removed transformers method. In our path
+            head_mask is always None, so the list branch is what runs."""
+            if head_mask is not None:
+                head_mask = self._convert_head_mask_to_5d(head_mask,
+                                                          num_hidden_layers)
+                if is_attention_chunked:
+                    head_mask = head_mask.unsqueeze(-1)
+            else:
+                head_mask = [None] * num_hidden_layers
+            return head_mask
+
+        PreTrainedModel._convert_head_mask_to_5d = _convert_head_mask_to_5d
+        PreTrainedModel.get_head_mask = get_head_mask
+        patched.append("get_head_mask (reimplemented)")
+
     return patched
 
 
@@ -129,12 +210,39 @@ def load_cosmos(model_id: str = COSMOS_ID):
     _p = _shim_transformers_for_cosmos()
     print(f"cosmos: transformers {transformers.__version__}"
           + (f", shimmed {len(_p)} helpers: {', '.join(_p)}" if _p else ""))
+    # low_cpu_mem_usage=False   - 5.x initialises on the meta device by default
+    #                             and the vendored __init__ calls .item(), which
+    #                             meta tensors cannot do ("Tensor.item() cannot
+    #                             be called on meta tensors")
+    # ignore_mismatched_sizes   - the checkpoint stores logit_scale and
+    #                             logit_bias as shape [1] where the code
+    #                             declares scalars. Both are the CLIP-style
+    #                             temperature; reinitialising them costs us
+    #                             nothing because cosmos_zeroshot() applies its
+    #                             own fixed scale and only the RANKING is used.
+    common = dict(trust_remote_code=True, low_cpu_mem_usage=False,
+                  ignore_mismatched_sizes=True)
     last = None
     for dt in (torch.float16, torch.float32):
         try:
-            m = AutoModel.from_pretrained(model_id, trust_remote_code=True,
-                                          torch_dtype=dt).to(DEVICE).eval()
+            try:                     # 5.x renamed torch_dtype -> dtype
+                m = AutoModel.from_pretrained(model_id, dtype=dt, **common)
+            except TypeError:
+                m = AutoModel.from_pretrained(model_id, torch_dtype=dt, **common)
+            m = m.to(DEVICE).eval()
             p = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+            # The bundled tokenizer ships without a pad token, and the vendored
+            # preprocessor calls the tokenizer WITH padding=True - so the text
+            # tower raises "Asking to pad but the tokenizer does not have a
+            # padding token" while the video tower works fine. Reuse eos as pad,
+            # which is the standard remedy and harmless here: attention_mask
+            # still marks the padding, so padded positions are masked out of the
+            # encoder either way and the embedding is unchanged.
+            _tok = getattr(p, "tokenizer", None)
+            if _tok is not None and _tok.pad_token is None:
+                _tok.pad_token = _tok.eos_token or _tok.unk_token or "[PAD]"
+                print(f"cosmos: tokenizer had no pad token, using "
+                      f"{_tok.pad_token!r}")
             print(f"cosmos: {model_id} loaded as {dt}")
             return m, p, dt
         except Exception as e:
@@ -162,6 +270,17 @@ def cosmos_video_embedding(frames_bgr: list, model, proc, dtype):
               for k, v in inputs.items()}
     out = model.get_video_embeddings(**inputs)
     v = getattr(out, "visual_proj", out)
+    # Guard, because the failure this hit is silent. On transformers 5.x the
+    # video tower returns all-NaN with clean weights (0 of 819 params NaN),
+    # valid inputs and fp32 - so similarities come back NaN, argmax picks
+    # whatever index NaN sorts to, and the diagnostic would print a confident
+    # wrong answer rather than an error. See COSMOS_VERSION_NOTE below.
+    if torch.isnan(v).any() or torch.isinf(v).any():
+        raise RuntimeError(
+            "Cosmos video tower returned NaN. The weights are fine and the "
+            "input is fine - this is the transformers version skew described in "
+            "COSMOS_VERSION_NOTE. Run this in a notebook with an older "
+            "transformers pinned, not here.")
     return v.float().cpu().numpy().reshape(-1)
 
 
