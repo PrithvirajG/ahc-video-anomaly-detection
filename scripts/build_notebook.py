@@ -112,6 +112,28 @@ step is pixels→vectors and the step worth iterating on is the classifier over
 them. Nothing downstream consumes the probe yet — that decision waits on the
 held-out numbers printed here."""),
 
+    ("c05c_cosmos.py", """## 5c — Does a purpose-built model read it differently? *(diagnostic, off by default)*
+
+On T025 the pipeline now has **perfect coverage** — all six real events get a VLM
+window inside them — every one of eleven classes on offer, an explicit
+cause-before-effect instruction, and frames at native resolution cropped to the
+motion region. Under all of that, Qwen3-VL-4B writes the same sentence every
+time: *"a dense queue of vehicles is stopped or moving very slowly"* →
+`traffic_congestion`. Truth says `traffic_accident`, six times.
+
+Coverage, frame filtering, duration and resolution are all eliminated by
+measurement. What is left is the model's reading. So ask a second,
+independently-trained one: **Cosmos-Embed1**, 1B params LoRA-tuned on
+VAD-Reasoning (1,755 videos, 24 anomaly categories), which has a text tower and
+can therefore be asked **zero-shot** — no probe to fit, no re-embed.
+
+Both answers are useful. If Cosmos names these correctly, building it in is
+clearly worth the time. If it agrees with Qwen, two independently-trained models
+disagree with the label and the thing to fix is elsewhere.
+
+Needs `trust_remote_code` (so internet on), and frees the VLM first — three
+models will not fit a 16GB T4."""),
+
     ("c06_stage2.py", """## 6 — Stage 2: the small VLM
 
 Runs only on what stage 1 could not clear. **Qwen3-VL-4B**, not the 3B this
