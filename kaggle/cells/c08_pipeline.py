@@ -89,6 +89,32 @@ def pick_frames(window: list[dict], n: int) -> list[dict]:
     return [window[i] for i in sorted(set(idx.tolist()))]
 
 
+def widen_window(kept: list[dict], centre_t: float, cfg=None) -> list[dict]:
+    """cfg.vlm_frames frames spread over cfg.vlm_span_sec, centred on centre_t.
+
+    An escalation window is ~2s wide because that is how often we sample, not
+    because incidents last 2s. Handing the VLM only those frames is why it
+    describes aftermath: a collision is over in about a second, and every later
+    frame shows a queue. Widening to the probe's 16s gives both stages the same
+    width of evidence and covers the median real event.
+
+    Falls back to the window's own frames when the video is too short to widen,
+    so a 6s L1 clip behaves exactly as before.
+    """
+    cfg = cfg or CFG
+    span = float(getattr(cfg, "vlm_span_sec", 0.0) or 0.0)
+    n = cfg.vlm_frames
+    if span <= 0 or not kept:
+        return []
+    near = [k for k in kept if abs(k["t"] - centre_t) <= span / 2]
+    if len(near) < 2:
+        return []
+    if len(near) <= n:
+        return near
+    idx = np.linspace(0, len(near) - 1, n).round().astype(int)
+    return [near[i] for i in sorted(set(idx.tolist()))]
+
+
 def _runtime_stats_since(model_name: str, start_idx: int) -> dict | None:
     """Slice CALL_LOG since this video started, for the arena's model_runtimes.
 
@@ -132,7 +158,13 @@ def process_video(path, cfg=None, verbose=False) -> dict:
     results = []
     t_vlm0 = time.time()
     for w, source in to_look_at:
-        picked = pick_frames(w, cfg.vlm_frames)
+        centre_t = (w[0]["t"] + w[-1]["t"]) / 2
+        # Widen to cfg.vlm_span_sec where the video allows it, else fall back to
+        # the escalation window itself. `widened` is truthy only when the VLM
+        # actually judged the wider span, which is what makes the event extent
+        # below an honest claim rather than an assumed one.
+        widened = widen_window(kept, centre_t, cfg)
+        picked = widened or pick_frames(w, cfg.vlm_frames)
         pil = [to_pil(draw_visual_prompt(r["frame"], r["box"], cfg.visual_prompt))
                for r in picked]
         emb = embed_images(pil)
@@ -140,7 +172,6 @@ def process_video(path, cfg=None, verbose=False) -> dict:
         # it costs nothing: stage 1 already encoded these frames and cell 5 now
         # keeps the vectors. Scored BEFORE the VLM so its shortlist can steer
         # the question, and kept afterwards so it can contradict the answer.
-        centre_t = (w[0]["t"] + w[-1]["t"]) / 2
         pw = probe_window(kept, centre_t, cfg) if "probe_window" in globals() else {}
         p_anom = float(1.0 - pw.get("normal", 1.0)) if pw else 0.0
         cands = shortlist_classes(emb)
@@ -215,9 +246,12 @@ def process_video(path, cfg=None, verbose=False) -> dict:
             # deal: probe-span extents score IoU 0.800 against five of T025's
             # six real 20s events, where a 2s window buffered to 6s scores 0.30
             # and fails the gate no matter how right the class is.
-            "span": ([round(centre_t - PROBE_SPAN_SEC / 2, 2),
-                      round(centre_t + PROBE_SPAN_SEC / 2, 2)]
-                     if overrode and "PROBE_SPAN_SEC" in globals() else None),
+            # Set whenever the VLM actually judged the wider span - not only on
+            # an override. If the model looked at 16s to reach its verdict, 16s
+            # is the interval that verdict covers, whichever stage said it.
+            "span": ([round(picked[0]["t"], 2),
+                      round(picked[-1]["t"] + 1.0 / cfg.sample_fps, 2)]
+                     if widened else None),
         })
     t_vlm = time.time() - t_vlm0
     n_scan = sum(1 for _, s in to_look_at if s == "scan")

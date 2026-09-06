@@ -70,8 +70,23 @@ class Config:
     # load_vlm() for the VRAM math and the organizer-referenced papers that
     # independently validate this exact model for this exact task.
     vlm_id: str = "Qwen/Qwen3-VL-4B-Instruct"
-    vlm_frames: int = 4            # frames per escalated window
+    vlm_frames: int = 8            # frames per escalated window
     vlm_max_new_tokens: int = 160
+
+    # How much TIME those frames span. Was implicitly ~2s - four consecutive
+    # samples at 2fps - and that is the measured cause of our worst remaining
+    # error. On T025, given every class and an explicit instruction to look for
+    # the cause, the model wrote "a dense queue of vehicles is stopped or moving
+    # very slowly" and answered traffic_congestion. The truth is
+    # traffic_accident. Four frames of a queue IS a queue: a collision is over
+    # in about a second and what remains is its aftermath, so a 2s look at any
+    # moment after impact cannot contain the evidence that separates the two.
+    #
+    # 16s matches the probe's span, so both stages now judge the same width of
+    # video, and it is the median real event length. Costs roughly double in
+    # stage 2, which is 82% of wall time - about 9 minutes becoming 14 on the
+    # five-video set.
+    vlm_span_sec: float = 16.0
 
     # --- temporal aggregation --------------------------------------------
     enter_conf: float = 0.55       # stage-2 confidence to open an event
